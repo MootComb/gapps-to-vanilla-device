@@ -34,8 +34,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt-get update
+          apt-get install -y \
             erofs-utils \
             e2fsprogs \
             android-sdk-libsparse-utils \
@@ -66,8 +66,8 @@ jobs:
 
       - name: Create working directories on ext4 (/mnt/work)
         run: |
-          sudo mkdir -p "$WORK_ROOT"
-          sudo chown $USER:$USER "$WORK_ROOT"
+          mkdir -p "$WORK_ROOT"
+          chown $USER:$USER "$WORK_ROOT"
           mkdir -p "$WORK_ROOT/gapps" "$WORK_ROOT/vanilla" "$WORK_ROOT/work" "$WORK_ROOT/otaripper" "$WORK_ROOT/erofs-utils-src" "$WORK_ROOT/tmp"
           echo "Working directories created in $WORK_ROOT (ext4)."
           df -T "$WORK_ROOT"
@@ -83,8 +83,8 @@ jobs:
           ./autogen.sh
           ./configure --prefix=/usr/local --enable-fuse
           make -j$(nproc)
-          sudo make install
-          sudo ldconfig
+          make install
+          ldconfig
           echo "=== erofs-utils installed ==="
           which mkfs.erofs fsck.erofs dump.erofs erofsfuse extract.erofs || true
           echo "=== mkfs.erofs ==="
@@ -116,8 +116,8 @@ jobs:
             BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' | head -1)
           fi
           echo "Found binary: $BIN"
-          sudo cp "$BIN" /usr/local/bin/otaripper
-          sudo chmod +x /usr/local/bin/otaripper
+          cp "$BIN" /usr/local/bin/otaripper
+          chmod +x /usr/local/bin/otaripper
           otaripper --version 2>&1 | head -5 || true
           otaripper --help 2>&1 | head -20 || true
 
@@ -226,12 +226,12 @@ jobs:
 
             local mnt="$WORK_ROOT/tmp/mnt_$$"
             rm -rf "$mnt"; mkdir -p "$mnt"
-            if sudo mount -o loop,ro "$img" "$mnt" >/dev/null 2>&1; then
+            if mount -o loop,ro "$img" "$mnt" >/dev/null 2>&1; then
               echo "  OK: mount loop (copying contents then unmounting)"
-              sudo rsync -aHAX --numeric-ids --exclude=lost+found "$mnt"/ "$out"/ || \
-                sudo cp -a "$mnt"/. "$out"/
-              sudo umount "$mnt" || sudo umount -l "$mnt" || true
-              sudo chown -R $USER:$USER "$out" || true
+              rsync -aHAX --numeric-ids --exclude=lost+found "$mnt"/ "$out"/ || \
+                cp -a "$mnt"/. "$out"/
+              umount "$mnt" || umount -l "$mnt" || true
+              chown -R $USER:$USER "$out" || true
               rm -rf "$mnt"
               return 0
             fi
@@ -271,6 +271,42 @@ jobs:
 
           echo "=== Extraction complete ==="
           ls -la
+
+      - name: Log source image sizes (before)
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          echo "=== Source .img sizes (before modification) ===" | tee sizes_before.txt
+          for side in gapps vanilla; do
+            for part in system system_ext product; do
+              img=$(find "$WORK_ROOT/$side/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+              if [ -n "$img" ] && [ -f "$img" ]; then
+                RAW=$(stat -c %s "$img")
+                SPARSE=$(file -b "$img" | grep -qi "Android sparse" && echo "yes" || echo "no")
+                PACKED=$(du -sh "$img" | awk '{print $1}')
+                printf '%-7s %-11s %12s bytes  du=%s  sparse=%s  %s\n' \
+                  "$side" "$part" "$RAW" "$PACKED" "$SPARSE" "$img" | tee -a sizes_before.txt
+              else
+                printf '%-7s %-11s MISSING\n' "$side" "$part" | tee -a sizes_before.txt
+              fi
+            done
+          done
+
+          echo "" | tee -a sizes_before.txt
+          echo "=== Extracted raw tree sizes (on-disk, after fsck.erofs) ===" | tee -a sizes_before.txt
+          for side in gapps vanilla; do
+            for part in system system_ext product; do
+              d="${side}_${part}_raw"
+              [ -d "$d" ] || continue
+              FILES=$(find "$d" -type f | wc -l)
+              LINKS=$(find "$d" -type l | wc -l)
+              DIRS=$(find "$d" -type d | wc -l)
+              BYTES=$(du -sb "$d" | awk '{print $1}')
+              printf '%-7s %-11s files=%-7s links=%-5s dirs=%-6s bytes=%s\n' \
+                "$side" "$part" "$FILES" "$LINKS" "$DIRS" "$BYTES" | tee -a sizes_before.txt
+            done
+          done
 
       - name: Compute and apply GApps to Vanilla diff (AOSP replacement)
         run: |
@@ -319,9 +355,9 @@ jobs:
             local src="$1" dst="$2"
             mkdir -p "$(dirname "$dst")"
             if [ ! -r "$src" ]; then
-              echo "  WARN: unreadable $src, trying sudo cp"
-              sudo cp -a --preserve=all "$src" "$dst" 2>/dev/null || { echo "  ERROR: cannot copy $src"; return 1; }
-              sudo chown $USER:$USER "$dst" || true
+              echo "  WARN: unreadable $src, trying cp"
+              cp -a --preserve=all "$src" "$dst" 2>/dev/null || { echo "  ERROR: cannot copy $src"; return 1; }
+              chown $USER:$USER "$dst" || true
             else
               cp -a --preserve=all "$src" "$dst" 2>/dev/null || cp -a "$src" "$dst"
             fi
@@ -363,12 +399,32 @@ jobs:
             sort -t $'\t' -k2,2 "$out" -o "$out"
           }
 
+          size_of() {
+            local p="$1"
+            if [ -L "$p" ]; then
+              printf 'link'
+            elif [ -f "$p" ]; then
+              stat -c %s "$p" 2>/dev/null || echo 0
+            elif [ -d "$p" ]; then
+              printf 'dir'
+            else
+              printf 'absent'
+            fi
+          }
+
           apply_part_diff() {
             local part="$1"
             local gapps_dir="gapps_${part}_raw"
             local vanilla_dir="vanilla_${part}_raw"
             [ -d "$gapps_dir" ] || { echo "SKIP $part: no gapps dir"; return 0; }
             [ -d "$vanilla_dir" ] || { echo "SKIP $part: no vanilla dir"; return 0; }
+
+            local log="diff_${part}.log"
+            : > "$log"
+            {
+              echo "# part=${part}"
+              echo "# columns: action  rel_path  old_bytes  new_bytes"
+            } >> "$log"
 
             echo "=== Diff $part ==="
             build_manifest "$gapps_dir"   "manifest_g_${part}.tsv"
@@ -393,49 +449,84 @@ jobs:
             echo "  only_in_vanilla: $(wc -l < only_v_${part}.tsv)"
             echo "  differ:          $(wc -l < diff_${part}.tsv)"
 
+            local removed_bytes=0 added_bytes=0 replaced_bytes_old=0 replaced_bytes_new=0
+            local n_removed=0 n_added=0 n_replaced=0
+
             while IFS=$'\t' read -r t rel; do
               [ -z "$rel" ] && continue
               if is_protected "$rel"; then
-                echo "  KEEP(build.prop) $rel"
+                printf 'KEEP_PROTECTED\t%s\t%s\t-\n' "$rel" "$(size_of "$gapps_dir/$rel")" >> "$log"
                 continue
               fi
+              local old=$(size_of "$gapps_dir/$rel")
+              [ "$old" = "link" ] || [ "$old" = "dir" ] && old=0
+              removed_bytes=$((removed_bytes + old)); n_removed=$((n_removed + 1))
+              printf 'REMOVED\t%s\t%s\t0\n' "$rel" "$old" >> "$log"
               rm -f "$gapps_dir/$rel"
             done < "only_g_${part}.tsv"
 
             while IFS=$'\t' read -r t rel; do
               [ -z "$rel" ] && continue
-              src="$vanilla_dir/$rel"
-              dst="$gapps_dir/$rel"
+              local src="$vanilla_dir/$rel" dst="$gapps_dir/$rel"
+              local new=$(size_of "$src")
+              [ "$new" = "link" ] || [ "$new" = "dir" ] && new=0
               if is_apex_path "$rel"; then
                 materialize_apex "$src" "$dst" || true
               else
                 copy_preserve_xattr "$src" "$dst" || true
               fi
+              added_bytes=$((added_bytes + new)); n_added=$((n_added + 1))
+              printf 'ADDED\t%s\t0\t%s\n' "$rel" "$new" >> "$log"
             done < "only_v_${part}.tsv"
 
             while IFS=$'\t' read -r t rel; do
               [ -z "$rel" ] && continue
               if is_protected "$rel"; then
-                echo "  KEEP(build.prop) $rel (differs, not replaced)"
+                printf 'KEEP_PROTECTED_DIFF\t%s\t%s\t%s\n' \
+                  "$rel" "$(size_of "$gapps_dir/$rel")" "$(size_of "$vanilla_dir/$rel")" >> "$log"
                 continue
               fi
+              local old=$(size_of "$gapps_dir/$rel")
+              [ "$old" = "link" ] || [ "$old" = "dir" ] && old=0
+              local new=$(size_of "$vanilla_dir/$rel")
+              [ "$new" = "link" ] || [ "$new" = "dir" ] && new=0
               case "$rel" in
                 *framework-res.apk|framework-res.apk)
-                  echo "  WARN: replacing framework-res.apk with AOSP version"
+                  printf 'WARN_FRAMEWORK_RES\t%s\t%s\t%s\n' "$rel" "$old" "$new" >> "$log"
                   ;;
               esac
-              src="$vanilla_dir/$rel"
-              dst="$gapps_dir/$rel"
+              local src="$vanilla_dir/$rel" dst="$gapps_dir/$rel"
               if is_apex_path "$rel"; then
                 materialize_apex "$src" "$dst" || true
               else
                 copy_preserve_xattr "$src" "$dst" || true
               fi
+              replaced_bytes_old=$((replaced_bytes_old + old))
+              replaced_bytes_new=$((replaced_bytes_new + new))
+              n_replaced=$((n_replaced + 1))
+              printf 'REPLACED\t%s\t%s\t%s\n' "$rel" "$old" "$new" >> "$log"
             done < "diff_${part}.tsv"
+
+            {
+              echo ""
+              echo "## summary ${part}"
+              echo "removed_count=${n_removed} removed_bytes=${removed_bytes}"
+              echo "added_count=${n_added} added_bytes=${added_bytes}"
+              echo "replaced_count=${n_replaced} replaced_bytes_old=${replaced_bytes_old} replaced_bytes_new=${replaced_bytes_new}"
+            } | tee -a "$log"
+
+            echo "  detail log -> $log"
           }
 
           for part in system system_ext product; do
             apply_part_diff "$part"
+          done
+
+          echo ""
+          echo "=== DIFF SUMMARY (all parts) ==="
+          for part in system system_ext product; do
+            [ -f "diff_${part}.log" ] || continue
+            grep -E '^(removed_|added_|replaced_)' "diff_${part}.log" | sed "s/^/${part}: /"
           done
 
           echo "=== Diff applied ==="
@@ -648,6 +739,39 @@ jobs:
             ls -lh "${part}.img"
           done
 
+      - name: Log rebuilt image sizes (after)
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          echo "=== Rebuilt .img sizes (after modification) ===" | tee sizes_after.txt
+          for part in system system_ext product; do
+            if [ -f "${part}.img" ]; then
+              RAW=$(stat -c %s "${part}.img")
+              PACKED=$(du -sh "${part}.img" | awk '{print $1}')
+              FMT=$(cat "${part}_format.txt" 2>/dev/null || echo '?')
+              UUID=$(cat "${part}_uuid.txt" 2>/dev/null || echo '-')
+              SPARSE=$(file -b "${part}.img" | grep -qi "Android sparse" && echo "yes" || echo "no")
+              printf '%-11s %12s bytes  du=%s  fmt=%s  uuid=%s  sparse=%s\n' \
+                "$part" "$RAW" "$PACKED" "$FMT" "$UUID" "$SPARSE" | tee -a sizes_after.txt
+            else
+              printf '%-11s MISSING\n' "$part" | tee -a sizes_after.txt
+            fi
+          done
+
+          echo "" | tee -a sizes_after.txt
+          echo "=== Delta per part ===" | tee -a sizes_after.txt
+          for part in system system_ext product; do
+            before=$(grep -E "^gapps +${part} " sizes_before.txt 2>/dev/null | awk '{print $3}' | head -1)
+            after=$(stat -c %s "${part}.img" 2>/dev/null || echo 0)
+            if [ -n "$before" ] && [ "$before" != "MISSING" ] && [ "$after" -gt 0 ]; then
+              delta=$((after - before))
+              pct=$(awk -v b="$before" -v d="$delta" 'BEGIN{ if(b>0) printf "%+.2f%%", d*100/b; else print "-" }')
+              printf '%-11s before=%-12s after=%-12s delta=%s (%s)\n' \
+                "$part" "$before" "$after" "$delta" "$pct" | tee -a sizes_after.txt
+            fi
+          done
+
       - name: Create recovery flashable ZIP
         run: |
           set -e
@@ -713,6 +837,17 @@ jobs:
           cd ..
           ls -lh convert-to-vanilla.zip
 
+          Z=$(stat -c %s convert-to-vanilla.zip)
+          echo "convert-to-vanilla.zip size: $Z bytes"
+          if [ "$Z" -ge 2147483648 ]; then
+            echo "ERROR: zip >= 2 GiB, splitting into 1900m parts"
+            rm -f convert-to-vanilla.z*
+            zip -r -9 -s 1900m ../convert-to-vanilla-split.zip . -x "*.git*" >/dev/null
+            mv ../convert-to-vanilla-split.z* . 2>/dev/null || true
+            mv ../convert-to-vanilla-split.zip ./convert-to-vanilla-split.zip 2>/dev/null || true
+            ls -lh convert-to-vanilla-split.*
+          fi
+
       - name: Determine release tag
         id: release_tag
         run: |
@@ -774,4 +909,7 @@ jobs:
             /mnt/work/work/*_format.txt
             /mnt/work/work/*_uuid.txt
             /mnt/work/work/*_erofs_params.txt
+            /mnt/work/work/sizes_before.txt
+            /mnt/work/work/sizes_after.txt
+            /mnt/work/work/diff_*.log
           retention-days: 7
