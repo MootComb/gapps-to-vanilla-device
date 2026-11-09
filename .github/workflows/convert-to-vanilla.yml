@@ -34,8 +34,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          apt-get update
-          apt-get install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
             erofs-utils \
             e2fsprogs \
             android-sdk-libsparse-utils \
@@ -66,8 +66,8 @@ jobs:
 
       - name: Create working directories on ext4 (/mnt/work)
         run: |
-          mkdir -p "$WORK_ROOT"
-          chown $USER:$USER "$WORK_ROOT"
+          sudo mkdir -p "$WORK_ROOT"
+          sudo chown $USER:$USER "$WORK_ROOT"
           mkdir -p "$WORK_ROOT/gapps" "$WORK_ROOT/vanilla" "$WORK_ROOT/work" "$WORK_ROOT/otaripper" "$WORK_ROOT/erofs-utils-src" "$WORK_ROOT/tmp"
           echo "Working directories created in $WORK_ROOT (ext4)."
           df -T "$WORK_ROOT"
@@ -83,8 +83,8 @@ jobs:
           ./autogen.sh
           ./configure --prefix=/usr/local --enable-fuse
           make -j$(nproc)
-          make install
-          ldconfig
+          sudo make install
+          sudo ldconfig
           echo "=== erofs-utils installed ==="
           which mkfs.erofs fsck.erofs dump.erofs erofsfuse extract.erofs || true
           echo "=== mkfs.erofs ==="
@@ -116,8 +116,8 @@ jobs:
             BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' | head -1)
           fi
           echo "Found binary: $BIN"
-          cp "$BIN" /usr/local/bin/otaripper
-          chmod +x /usr/local/bin/otaripper
+          sudo cp "$BIN" /usr/local/bin/otaripper
+          sudo chmod +x /usr/local/bin/otaripper
           otaripper --version 2>&1 | head -5 || true
           otaripper --help 2>&1 | head -20 || true
 
@@ -226,12 +226,12 @@ jobs:
 
             local mnt="$WORK_ROOT/tmp/mnt_$$"
             rm -rf "$mnt"; mkdir -p "$mnt"
-            if mount -o loop,ro "$img" "$mnt" >/dev/null 2>&1; then
+            if sudo mount -o loop,ro "$img" "$mnt" >/dev/null 2>&1; then
               echo "  OK: mount loop (copying contents then unmounting)"
-              rsync -aHAX --numeric-ids --exclude=lost+found "$mnt"/ "$out"/ || \
-                cp -a "$mnt"/. "$out"/
-              umount "$mnt" || umount -l "$mnt" || true
-              chown -R $USER:$USER "$out" || true
+              sudo rsync -aHAX --numeric-ids --exclude=lost+found "$mnt"/ "$out"/ || \
+                sudo cp -a "$mnt"/. "$out"/
+              sudo umount "$mnt" || sudo umount -l "$mnt" || true
+              sudo chown -R $USER:$USER "$out" || true
               rm -rf "$mnt"
               return 0
             fi
@@ -355,9 +355,9 @@ jobs:
             local src="$1" dst="$2"
             mkdir -p "$(dirname "$dst")"
             if [ ! -r "$src" ]; then
-              echo "  WARN: unreadable $src, trying cp"
-              cp -a --preserve=all "$src" "$dst" 2>/dev/null || { echo "  ERROR: cannot copy $src"; return 1; }
-              chown $USER:$USER "$dst" || true
+              echo "  WARN: unreadable $src, trying sudo cp"
+              sudo cp -a --preserve=all "$src" "$dst" 2>/dev/null || { echo "  ERROR: cannot copy $src"; return 1; }
+              sudo chown $USER:$USER "$dst" || true
             else
               cp -a --preserve=all "$src" "$dst" 2>/dev/null || cp -a "$src" "$dst"
             fi
