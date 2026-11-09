@@ -6,11 +6,11 @@ on:
       gapps_url:
         description: 'URL of the GApps firmware (zip OTA, zip images, img.xz, or raw img)'
         required: false
-        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-X6833B-18.10.2026-GAPPS-OFFICIAL.zip'
+        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.2-X6833B-08.11.2026-GAPPS-OFFICIAL.zip'
       vanilla_url:
         description: 'URL of the Vanilla firmware (zip OTA, zip images, img.xz, or raw img)'
         required: false
-        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-dubai-18.10.2026-VANILLA-OFFICIAL.zip'
+        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.2-surya-07.11.2026-VANILLA-OFFICIAL.zip'
       release_tag:
         description: 'Release tag (use "auto" for automatic timestamp-based tag)'
         required: false
