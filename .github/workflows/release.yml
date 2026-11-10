@@ -1,4 +1,4 @@
-name: Convert GApps to Vanilla
+name: Release
 
 on:
   workflow_dispatch:
