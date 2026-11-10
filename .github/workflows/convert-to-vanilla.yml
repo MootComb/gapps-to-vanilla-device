@@ -62,7 +62,8 @@ jobs:
             automake \
             libtool \
             python3 \
-            python3-pip
+            python3-pip \
+            brotli
 
       - name: Create working directories on ext4 (/mnt/work)
         run: |
@@ -169,9 +170,9 @@ jobs:
           echo "=== GApps extracted ==="
           ls -lh extracted/
 
-      - name: Extract Vanilla archive and payload.bin (otaripper)
+      - name: Extract Vanilla archive and payload.bin (otaripper / block-OTA)
         run: |
-          set -e
+          set -euo pipefail
           cd "$WORK_ROOT/vanilla"
           mkdir -p extracted
 
@@ -196,6 +197,42 @@ jobs:
             find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
             find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
             find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
+          fi
+
+          if find extracted -maxdepth 1 -name '*.new.dat.br' -print -quit | grep -q .; then
+            echo "Vanilla: block-based OTA detected (.new.dat.br). Installing decoders..."
+
+            sudo apt-get install -y brotli python3-pip >/dev/null
+            pip3 install --quiet --break-system-packages sdat2img || \
+              pip3 install --quiet sdat2img || true
+
+            SDAT2IMG=$(command -v sdat2img || command -v sdat2img.py || true)
+            if [ -z "$SDAT2IMG" ]; then
+              echo "sdat2img not found in PATH, downloading script"
+              curl -fsSL -o "$WORK_ROOT/tmp/sdat2img.py" \
+                https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
+              chmod +x "$WORK_ROOT/tmp/sdat2img.py"
+              SDAT2IMG="$WORK_ROOT/tmp/sdat2img.py"
+            fi
+
+            for part in system system_ext product vendor; do
+              local_br="extracted/${part}.new.dat.br"
+              local_dat="extracted/${part}.new.dat"
+              local_tl="extracted/${part}.transfer.list"
+              local_img="extracted/${part}.img"
+
+              if [ -f "$local_br" ] && [ -f "$local_tl" ]; then
+                echo "  Decoding ${part}.new.dat.br -> ${part}.new.dat"
+                brotli -d -f -o "$local_dat" "$local_br"
+                echo "  Converting ${part}.new.dat + ${part}.transfer.list -> ${part}.img"
+                python3 "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img" 2>/dev/null || \
+                  "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img"
+                rm -f "$local_dat"
+                ls -lh "$local_img"
+              else
+                echo "  skip ${part}: ${local_br} or ${local_tl} missing"
+              fi
+            done
           fi
 
           echo "=== Vanilla extracted ==="
@@ -236,6 +273,14 @@ jobs:
               return 0
             fi
             rm -rf "$mnt"
+
+            if command -v debugfs >/dev/null 2>&1; then
+              if debugfs -R "rdump / $out" "$img" >/dev/null 2>&1; then
+                echo "  OK: debugfs rdump (ext4)"
+                sudo chown -R $USER:$USER "$out" || true
+                return 0
+              fi
+            fi
 
             if simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
               echo "  OK: sparse -> simg2img"
