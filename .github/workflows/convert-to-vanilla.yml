@@ -39,6 +39,7 @@ jobs:
             erofs-utils \
             e2fsprogs \
             android-sdk-libsparse-utils \
+            brotli \
             zip \
             unzip \
             xz-utils \
@@ -62,8 +63,7 @@ jobs:
             automake \
             libtool \
             python3 \
-            python3-pip \
-            brotli
+            python3-pip
 
       - name: Create working directories on ext4 (/mnt/work)
         run: |
@@ -140,7 +140,7 @@ jobs:
 
       - name: Extract GApps archive and payload.bin (otaripper)
         run: |
-          set -e
+          set -euo pipefail
           cd "$WORK_ROOT/gapps"
           mkdir -p extracted
 
@@ -165,6 +165,37 @@ jobs:
             find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
             find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
             find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
+          fi
+
+          if find extracted -maxdepth 1 -name '*.new.dat.br' -print -quit | grep -q .; then
+            echo "GApps: block-based OTA detected (.new.dat.br). Installing decoders..."
+            sudo apt-get install -y brotli python3-pip >/dev/null
+            pip3 install --quiet --break-system-packages sdat2img || \
+              pip3 install --quiet sdat2img || true
+            SDAT2IMG=$(command -v sdat2img || command -v sdat2img.py || true)
+            if [ -z "$SDAT2IMG" ]; then
+              curl -fsSL -o "$WORK_ROOT/tmp/sdat2img.py" \
+                https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
+              chmod +x "$WORK_ROOT/tmp/sdat2img.py"
+              SDAT2IMG="$WORK_ROOT/tmp/sdat2img.py"
+            fi
+            for part in system system_ext product vendor; do
+              local_br="extracted/${part}.new.dat.br"
+              local_dat="extracted/${part}.new.dat"
+              local_tl="extracted/${part}.transfer.list"
+              local_img="extracted/${part}.img"
+              if [ -f "$local_br" ] && [ -f "$local_tl" ]; then
+                echo "  Decoding ${part}.new.dat.br -> ${part}.new.dat"
+                brotli -d -f -o "$local_dat" "$local_br"
+                echo "  Converting ${part}.new.dat + ${part}.transfer.list -> ${part}.img"
+                python3 "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img" 2>/dev/null || \
+                  "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img"
+                rm -f "$local_dat"
+                ls -lh "$local_img"
+              else
+                echo "  skip ${part}: ${local_br} or ${local_tl} missing"
+              fi
+            done
           fi
 
           echo "=== GApps extracted ==="
@@ -201,26 +232,21 @@ jobs:
 
           if find extracted -maxdepth 1 -name '*.new.dat.br' -print -quit | grep -q .; then
             echo "Vanilla: block-based OTA detected (.new.dat.br). Installing decoders..."
-
             sudo apt-get install -y brotli python3-pip >/dev/null
             pip3 install --quiet --break-system-packages sdat2img || \
               pip3 install --quiet sdat2img || true
-
             SDAT2IMG=$(command -v sdat2img || command -v sdat2img.py || true)
             if [ -z "$SDAT2IMG" ]; then
-              echo "sdat2img not found in PATH, downloading script"
               curl -fsSL -o "$WORK_ROOT/tmp/sdat2img.py" \
                 https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
               chmod +x "$WORK_ROOT/tmp/sdat2img.py"
               SDAT2IMG="$WORK_ROOT/tmp/sdat2img.py"
             fi
-
             for part in system system_ext product vendor; do
               local_br="extracted/${part}.new.dat.br"
               local_dat="extracted/${part}.new.dat"
               local_tl="extracted/${part}.transfer.list"
               local_img="extracted/${part}.img"
-
               if [ -f "$local_br" ] && [ -f "$local_tl" ]; then
                 echo "  Decoding ${part}.new.dat.br -> ${part}.new.dat"
                 brotli -d -f -o "$local_dat" "$local_br"
@@ -392,8 +418,18 @@ jobs:
 
       - name: Compute and apply GApps to Vanilla diff (AOSP replacement)
         run: |
-          set -e
+          set -euo pipefail
           cd "$WORK_ROOT/work"
+
+          MISSING=0
+          for part in system system_ext product; do
+            [ -d "gapps_${part}_raw" ]   || { echo "ERROR: gapps_${part}_raw missing";   MISSING=1; }
+            [ -d "vanilla_${part}_raw" ] || { echo "ERROR: vanilla_${part}_raw missing"; MISSING=1; }
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "FATAL: raw trees incomplete. Refusing to ship GApps-as-Vanilla."
+            exit 1
+          fi
 
           is_protected() {
             local rel="$1"
@@ -454,7 +490,7 @@ jobs:
             local f="$1"
             local sz
             sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
-            if [ "$sz" -lt 4194304 ]; then
+            if [ "$sz" -lt 67108864 ]; then
               sha256sum "$f" 2>/dev/null | awk '{print "sha256:"$1}'
             else
               stat -c "size:%s:mtime:%Y" "$f" 2>/dev/null
@@ -597,6 +633,23 @@ jobs:
               echo "replaced_count=${n_replaced} replaced_bytes_old=${replaced_bytes_old} replaced_bytes_new=${replaced_bytes_new}"
             } | tee -a "$log"
 
+            {
+              echo ""
+              echo "## bytes by top-level dir (removed / added / replaced_new)"
+              awk -F'\t' '
+                $1=="REMOVED"  { d=$2; sub(/\/.*/,"",d); r[d]+=$3 }
+                $1=="ADDED"    { d=$2; sub(/\/.*/,"",d); a[d]+=$4 }
+                $1=="REPLACED" { d=$2; sub(/\/.*/,"",d); p[d]+=$4 }
+                END {
+                  for (k in r) keys[k]=1
+                  for (k in a) keys[k]=1
+                  for (k in p) keys[k]=1
+                  for (k in keys)
+                    printf "%s\tremoved=%d\tadded=%d\treplaced_new=%d\n", k, r[k], a[k], p[k]
+                }
+              ' "diff_${part}.log" | sort -k2,2nr
+            } | tee -a "$log"
+
             echo "  detail log -> $log"
           }
 
@@ -612,6 +665,35 @@ jobs:
           done
 
           echo "=== Diff applied ==="
+
+      - name: Print diff report (stdout)
+        if: always()
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+          echo "############ DIFF SUMMARY (stdout) ############"
+          for part in system system_ext product; do
+            [ -f "diff_${part}.log" ] || { echo "${part}: no log"; continue; }
+            echo ""
+            echo "########## ${part} ##########"
+            grep -E '^## summary|^(removed_|added_|replaced_)' "diff_${part}.log" || true
+            echo ""
+            echo "--- top 15 REMOVED by size ---"
+            awk -F'\t' '$1=="REMOVED"{print $3"\t"$2}' "diff_${part}.log" \
+              | sort -k1,1nr | head -15 || true
+            echo ""
+            echo "--- top 15 ADDED by size ---"
+            awk -F'\t' '$1=="ADDED"{print $4"\t"$2}' "diff_${part}.log" \
+              | sort -k1,1nr | head -15 || true
+            echo ""
+            echo "--- top 15 REPLACED by delta ---"
+            awk -F'\t' '$1=="REPLACED"{print ($4-$3)"\t"$2"\t"$3"\t"$4}' "diff_${part}.log" \
+              | sort -k1,1nr | head -15 || true
+            echo ""
+            echo "--- bytes by top-level dir ---"
+            sed -n '/^## bytes by top-level dir/,$p' "diff_${part}.log" | head -40 || true
+          done
+          echo "############ END DIFF SUMMARY ############"
 
       - name: Detect original UUIDs and filesystem parameters
         run: |
@@ -724,9 +806,6 @@ jobs:
               fi
               if echo "$dump" | grep -qi "DEDUPE"; then
                 extra="$extra -Ededupe"
-              fi
-              if echo "$dump" | grep -qi "BIG_PCLUSTER"; then
-                extra="$extra -C$pcluster"
               fi
               if echo "$dump" | grep -qi "ZERO_PADDING\|LZ4_0PADDING"; then
                 extra="$extra -E0padding"
@@ -922,11 +1001,11 @@ jobs:
           Z=$(stat -c %s convert-to-vanilla.zip)
           echo "convert-to-vanilla.zip size: $Z bytes"
           if [ "$Z" -ge 2147483648 ]; then
-            echo "ERROR: zip >= 2 GiB, splitting into 1900m parts"
-            rm -f convert-to-vanilla.z*
-            zip -r -9 -s 1900m ../convert-to-vanilla-split.zip . -x "*.git*" >/dev/null
-            mv ../convert-to-vanilla-split.z* . 2>/dev/null || true
-            mv ../convert-to-vanilla-split.zip ./convert-to-vanilla-split.zip 2>/dev/null || true
+            echo "zip >= 2 GiB: splitting into 1900m parts and removing oversized original"
+            rm -f convert-to-vanilla-split.*
+            mv convert-to-vanilla.zip convert-to-vanilla-oversized.zip
+            zip -r -9 -s 1900m convert-to-vanilla-split.zip zip -x "*.git*" >/dev/null
+            rm -f convert-to-vanilla-oversized.zip
             ls -lh convert-to-vanilla-split.*
           fi
 
@@ -956,7 +1035,11 @@ jobs:
             - system.img
             - system_ext.img
             - product.img
-            - convert-to-vanilla.zip (recovery flashable)
+            - convert-to-vanilla.zip (single file, if < 2 GiB)
+            - convert-to-vanilla-split.z01..zNN + convert-to-vanilla-split.zip (split, if >= 2 GiB)
+
+            To reassemble split archive:
+              cat convert-to-vanilla-split.z* > convert-to-vanilla.zip
 
             Filesystem parameters and UUIDs preserved from original images.
             SELinux contexts preserved on all added files.
@@ -968,12 +1051,15 @@ jobs:
             /mnt/work/work/system_ext.img
             /mnt/work/work/product.img
             /mnt/work/work/convert-to-vanilla.zip
+            /mnt/work/work/convert-to-vanilla-split.zip
+            /mnt/work/work/convert-to-vanilla-split.z*
+          fail_on_unmatched_files: false
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload build artifacts
+      - name: Upload images (vanilla-images)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -983,6 +1069,17 @@ jobs:
             /mnt/work/work/system_ext.img
             /mnt/work/work/product.img
             /mnt/work/work/convert-to-vanilla.zip
+            /mnt/work/work/convert-to-vanilla-split.zip
+            /mnt/work/work/convert-to-vanilla-split.z*
+          retention-days: 7
+
+      - name: Upload diff logs (diff-logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-logs
+          path: |
+            /mnt/work/work/diff_*.log
             /mnt/work/work/manifest_g_*.tsv
             /mnt/work/work/manifest_v_*.tsv
             /mnt/work/work/only_g_*.tsv
@@ -993,5 +1090,4 @@ jobs:
             /mnt/work/work/*_erofs_params.txt
             /mnt/work/work/sizes_before.txt
             /mnt/work/work/sizes_after.txt
-            /mnt/work/work/diff_*.log
           retention-days: 7
