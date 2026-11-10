@@ -203,7 +203,7 @@ jobs:
 
       - name: Auto-detect image formats and extract partitions
         run: |
-          set -e
+          set -euo pipefail
           cd "$WORK_ROOT/work"
 
           extract_image() {
@@ -247,30 +247,67 @@ jobs:
             return 1
           }
 
+          find_part_img() {
+            local side="$1" part="$2"
+            find "$WORK_ROOT/$side/extracted" -type f \
+              \( -name "${part}.img" -o -name "${part}_a.img" -o -name "${part}_b.img" \) \
+              2>/dev/null | head -1
+          }
+
+          dump_extracted() {
+            local side="$1"
+            echo ""
+            echo "=== ls -lR $WORK_ROOT/$side/extracted ==="
+            if [ -d "$WORK_ROOT/$side/extracted" ]; then
+              ls -lR "$WORK_ROOT/$side/extracted" || true
+            else
+              echo "DIRECTORY DOES NOT EXIST: $WORK_ROOT/$side/extracted"
+            fi
+            echo "=== end $side ==="
+            echo ""
+          }
+
+          FAIL=0
+
           echo "=== Extracting GApps partitions ==="
+          dump_extracted gapps
           for part in system system_ext product; do
-            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            img=$(find_part_img gapps "$part")
             if [ -n "$img" ]; then
               echo "GApps ${part}: $img"
-              extract_image "$img" "gapps_${part}_raw" || exit 1
+              extract_image "$img" "gapps_${part}_raw" || { echo "ERROR: extract failed for gapps/${part}"; FAIL=1; }
             else
-              echo "WARNING: GApps ${part}.img not found"
+              echo "ERROR: GApps ${part}.img not found under $WORK_ROOT/gapps/extracted"
+              FAIL=1
             fi
           done
 
           echo "=== Extracting Vanilla partitions ==="
+          dump_extracted vanilla
           for part in system system_ext product; do
-            img=$(find "$WORK_ROOT/vanilla/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            img=$(find_part_img vanilla "$part")
             if [ -n "$img" ]; then
               echo "Vanilla ${part}: $img"
-              extract_image "$img" "vanilla_${part}_raw" || exit 1
+              extract_image "$img" "vanilla_${part}_raw" || { echo "ERROR: extract failed for vanilla/${part}"; FAIL=1; }
             else
-              echo "WARNING: Vanilla ${part}.img not found"
+              echo "ERROR: Vanilla ${part}.img not found under $WORK_ROOT/vanilla/extracted"
+              FAIL=1
             fi
           done
 
           echo "=== Extraction complete ==="
           ls -la
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo ""
+            echo "FATAL: one or more partitions missing from gapps/vanilla. Aborting."
+            echo "Expected layout: \$WORK_ROOT/{gapps,vanilla}/extracted/{system,system_ext,product}.img"
+            echo "Actual gapps files:"
+            find "$WORK_ROOT/gapps/extracted" -type f 2>/dev/null | head -50 || true
+            echo "Actual vanilla files:"
+            find "$WORK_ROOT/vanilla/extracted" -type f 2>/dev/null | head -50 || true
+            exit 1
+          fi
 
       - name: Log source image sizes (before)
         run: |
