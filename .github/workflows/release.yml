@@ -1020,32 +1020,199 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Release tag: $TAG"
 
+      - name: Compute release display name from GApps URL
+        id: release_name
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.gapps_url }}"
+
+          # Strip query string and fragment
+          BASE="${URL%%\?*}"
+          BASE="${BASE%%#*}"
+          FILENAME="${BASE##*/}"
+          NAME="${FILENAME%.zip}"
+          NAME="${NAME%.img}"
+          NAME="${NAME%.xz}"
+
+          echo "Raw filename: $NAME"
+
+          # Write the parser to a temp file (avoids heredoc inside $() which breaks YAML parsing)
+          cat > "$WORK_ROOT/tmp/parse_name.py" <<'PY'
+          import re, sys
+
+          name = sys.argv[1]
+          orig = name
+
+          SERVICE = {
+              'gapps', 'vanilla', 'official', 'unofficial', 'ota', 'full',
+              'fastboot', 'img', 'zip', 'dynamic', 'nondynamic', 'non-dynamic',
+              'pico', 'nano', 'micro', 'mini', 'basic',
+              'noesis', 'release', 'stable', 'beta', 'weekly', 'nightly',
+              'gms', 'aosp', 'signed', 'unsigned', 'test', 'debug',
+          }
+
+          def is_date(s):
+              return bool(re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', s)
+                          or re.fullmatch(r'\d{4}-\d{2}-\d{2}', s)
+                          or re.fullmatch(r'\d{8}', s))
+
+          def has_version(s):
+              return bool(re.search(r'\d+\.\d+', s))
+
+          parts = [p for p in name.split('-') if p]
+          if not parts:
+              print(orig); sys.exit(0)
+          lower = [p.lower() for p in parts]
+
+          date_idx = None
+          for i, p in enumerate(parts):
+              if is_date(p):
+                  date_idx = i
+                  break
+
+          proj_start = proj_end = None
+          for i, p in enumerate(parts):
+              if lower[i] in SERVICE:
+                  continue
+              if has_version(p):
+                  proj_start = proj_end = i
+                  break
+              if i + 1 < len(parts) and re.fullmatch(r'\d+(?:\.\d+)+', parts[i + 1]):
+                  proj_start = i
+                  proj_end = i + 1
+                  break
+              if '_' in p:
+                  for j in range(i + 1, min(i + 4, len(parts))):
+                      if re.search(r'\d+\.\d+', parts[j]):
+                          proj_start, proj_end = i, j
+                          break
+                  if proj_start is not None:
+                      break
+
+          if proj_start is None:
+              for i, p in enumerate(parts):
+                  if lower[i] in SERVICE or is_date(p):
+                      continue
+                  proj_start = i
+                  proj_end = i
+                  if i + 1 < len(parts) and re.fullmatch(r'\d+(?:\.\d+)*', parts[i + 1]):
+                      proj_end = i + 1
+                  break
+
+          if proj_start is None:
+              print(orig); sys.exit(0)
+
+          project = '-'.join(parts[proj_start:proj_end + 1])
+          project = re.sub(r'^Project[_-]', '', project, flags=re.I)
+
+          codename = None
+          if date_idx is not None:
+              for i in range(date_idx + 1, len(parts)):
+                  p = parts[i]
+                  if lower[i] in SERVICE or has_version(p):
+                      continue
+                  if re.fullmatch(r'[A-Za-z0-9_]+', p) and not is_date(p):
+                      codename = p
+                      break
+              if not codename:
+                  for i in range(date_idx - 1, -1, -1):
+                      p = parts[i]
+                      if proj_start <= i <= proj_end:
+                          continue
+                      if lower[i] in SERVICE or has_version(p):
+                          continue
+                      if re.fullmatch(r'[A-Za-z0-9_]+', p) and not is_date(p):
+                          codename = p
+                          break
+
+          if not codename:
+              for i in range(len(parts) - 1, -1, -1):
+                  p = parts[i]
+                  if proj_start <= i <= proj_end:
+                      continue
+                  if lower[i] in SERVICE or has_version(p) or is_date(p):
+                      continue
+                  if re.fullmatch(r'[A-Za-z0-9_]+', p):
+                      codename = p
+                      break
+
+          if not codename:
+              for i, p in enumerate(parts):
+                  if proj_start <= i <= proj_end:
+                      continue
+                  if lower[i] in SERVICE or is_date(p) or has_version(p):
+                      continue
+                  codename = p
+                  break
+
+          if not codename:
+              print(project if project else orig); sys.exit(0)
+
+          print(f"{codename}_{project}")
+          PY
+
+          DISPLAY=$(python3 "$WORK_ROOT/tmp/parse_name.py" "$NAME" || true)
+
+          if [ -z "$DISPLAY" ]; then
+            DISPLAY="$NAME"
+          fi
+
+          echo "release_name=$DISPLAY" >> $GITHUB_OUTPUT
+          echo "Computed release display name: $DISPLAY"
+
+      - name: Build release body based on actual artifacts
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+          BODY="$WORK_ROOT/work/release_body.md"
+
+          GENERATED_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+
+          # Count artifacts that will actually be attached
+          COUNT=3   # system.img, system_ext.img, product.img
+          [ -f convert-to-vanilla.zip ] && COUNT=$((COUNT + 1))
+          ls convert-to-vanilla-split.zip >/dev/null 2>&1 && COUNT=$((COUNT + 1))
+
+          {
+            echo "## gapps-to-vanilla"
+            echo ""
+            echo "**GApps source:** ${{ github.event.inputs.gapps_url }}"
+            echo "**Vanilla source:** ${{ github.event.inputs.vanilla_url }}"
+            echo ""
+            echo "**Generated:** $GENERATED_DATE"
+            echo "**Versions:** $COUNT"
+            echo ""
+            echo "**Artifacts:**"
+            echo "- system.img"
+            echo "- system_ext.img"
+            echo "- product.img"
+          } > "$BODY"
+
+          HAS_ZIP=0
+          HAS_SPLIT=0
+          [ -f convert-to-vanilla.zip ] && HAS_ZIP=1
+          ls convert-to-vanilla-split.zip >/dev/null 2>&1 && HAS_SPLIT=1
+
+          if [ "$HAS_ZIP" -eq 1 ]; then
+            echo "- convert-to-vanilla.zip" >> "$BODY"
+          fi
+
+          if [ "$HAS_SPLIT" -eq 1 ]; then
+            echo "- convert-to-vanilla-split.z01..zNN + convert-to-vanilla-split.zip" >> "$BODY"
+            echo "" >> "$BODY"
+            echo "To reassemble split archive:" >> "$BODY"
+            echo '  cat convert-to-vanilla-split.z* > convert-to-vanilla.zip' >> "$BODY"
+          fi
+
+          echo "=== release_body.md ==="
+          cat "$BODY"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_tag.outputs.tag }}
-          name: "Vanilla ${{ steps.release_tag.outputs.tag }}"
-          body: |
-            Automated GApps to Vanilla conversion
-
-            GApps source: ${{ github.event.inputs.gapps_url }}
-            Vanilla source: ${{ github.event.inputs.vanilla_url }}
-
-            Artifacts:
-            - system.img
-            - system_ext.img
-            - product.img
-            - convert-to-vanilla.zip (single file, if < 2 GiB)
-            - convert-to-vanilla-split.z01..zNN + convert-to-vanilla-split.zip (split, if >= 2 GiB)
-
-            To reassemble split archive:
-              cat convert-to-vanilla-split.z* > convert-to-vanilla.zip
-
-            Filesystem parameters and UUIDs preserved from original images.
-            SELinux contexts preserved on all added files.
-            Diff-based conversion: only files present in Vanilla are added,
-            only GApps-exclusive files are removed, differing files are replaced
-            with the Vanilla (AOSP) version. Exception: build.prop is never touched.
+          tag_name: ${{ steps.release_name.outputs.release_name }}
+          name: "${{ steps.release_name.outputs.release_name }}"
+          body_path: /mnt/work/work/release_body.md
           files: |
             /mnt/work/work/system.img
             /mnt/work/work/system_ext.img
