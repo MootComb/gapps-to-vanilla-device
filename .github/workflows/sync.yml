@@ -35,9 +35,6 @@ env:
 jobs:
   # ============================================================
   # JOB 0: SETUP
-  # Runs ONCE. Builds erofs-utils, downloads otaripper,
-  # warms apt cache. Uploads binaries as artifacts so convert
-  # jobs can just download them instead of rebuilding.
   # ============================================================
   setup:
     name: Setup build tools
@@ -180,11 +177,7 @@ jobs:
 
   # ============================================================
   # JOB 1: DISCOVER
-  # Scans official_devices repo (branches 17, 16, master).
-  # Donor priority:
-  #   1) external donor with SAME version
-  #   2) own vanilla (even if version differs)
-  #   3) external donor with closest timestamp (any version)
+  # Reads branch tarballs via codeload.github.com (no API, no token).
   # Builds report.json, matrix.json, stale.json.
   # ============================================================
   discover:
@@ -242,40 +235,46 @@ jobs:
           FILTER: ${{ inputs.device_filter }}
           FORCE: ${{ inputs.force_rebuild }}
           PRUNE: ${{ inputs.prune_stale }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p out
+          mkdir -p out repo
 
+          # --- 1. Download branch tarballs via codeload (no token, no API) ---
+          for br in 17 16 master; do
+            url="https://codeload.github.com/ProjectInfinity-X/official_devices/tar.gz/refs/heads/${br}"
+            code=$(curl -s -o "/tmp/od-${br}.tar.gz" -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              mkdir -p "repo/${br}"
+              tar -xzf "/tmp/od-${br}.tar.gz" -C "repo/${br}" --strip-components=1
+              echo "branch ${br}: OK" >&2
+            else
+              echo "branch ${br}: HTTP ${code} (skip)" >&2
+              rm -f "/tmp/od-${br}.tar.gz"
+            fi
+          done
+
+          # --- 2. Build report.json from local files ---
           python3 - <<'PY' > out/report.json
           import json, os, re, sys
           from datetime import datetime, timezone
-          from urllib.request import Request, urlopen
-          from urllib.error import HTTPError
 
-          UA = {"User-Agent": "Mozilla/5.0 projectinfinity-sync/1.0"}
-          REPO = "ProjectInfinity-X/official_devices"
           BRANCHES = ["17", "16", "master"]
-          API_CONTENTS = f"https://api.github.com/repos/{REPO}/contents/devices?ref={{branch}}"
-          RAW = "https://raw.githubusercontent.com/{repo}/{branch}/"
+          REPO_DIR = "repo"
 
-          def fetch_json(url):
+          def read_json(path):
               try:
-                  with urlopen(Request(url, headers=UA), timeout=60) as r:
-                      return json.loads(r.read())
-              except HTTPError:
-                  return None
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
               except Exception:
                   return None
 
           def list_devices():
               seen = {}
               for br in BRANCHES:
-                  data = fetch_json(API_CONTENTS.format(branch=br))
-                  if not data:
+                  d = os.path.join(REPO_DIR, br, "devices")
+                  if not os.path.isdir(d):
                       continue
-                  for f in data:
-                      name = f.get("name", "")
+                  for name in sorted(os.listdir(d)):
                       if name.endswith(".json"):
                           cn = name[:-5]
                           if cn not in seen:
@@ -283,7 +282,8 @@ jobs:
               return seen
 
           def build_info(branch, kind, codename):
-              data = fetch_json(RAW.format(repo=REPO, branch=branch) + f"{kind}/{codename}.json")
+              path = os.path.join(REPO_DIR, branch, kind, f"{codename}.json")
+              data = read_json(path)
               if not data:
                   return None
               resp = data.get("response")
@@ -292,8 +292,8 @@ jobs:
               return None
 
           def device_info(branch, codename):
-              data = fetch_json(RAW.format(repo=REPO, branch=branch) + f"devices/{codename}.json")
-              return data or {}
+              path = os.path.join(REPO_DIR, branch, "devices", f"{codename}.json")
+              return read_json(path) or {}
 
           def norm_version(v):
               return str(v).strip() if v else ""
@@ -318,6 +318,10 @@ jobs:
               return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else ""
 
           devices = list_devices()
+          print(f"Discovered {len(devices)} devices", file=sys.stderr)
+          if not devices:
+              print("ERROR: no devices found in any branch", file=sys.stderr)
+
           filt = set(x.strip() for x in os.environ.get("FILTER", "").split(",") if x.strip())
           force = os.environ.get("FORCE", "false") == "true"
 
@@ -410,8 +414,6 @@ jobs:
 
               if v and norm_version(g.get("version")) == norm_version(v.get("version")):
                   entry["reason"] = f"vanilla exists with same version {norm_version(v.get('version'))}"
-                  entry["publish"] = False
-                  entry["action"] = "skip"
                   report.append(entry)
                   continue
 
@@ -456,8 +458,6 @@ jobs:
 
               if not chosen:
                   entry["reason"] = "no vanilla and no donor available"
-                  entry["publish"] = False
-                  entry["action"] = "skip"
                   report.append(entry)
                   continue
 
@@ -562,7 +562,7 @@ jobs:
           if [ -f existing/manifest.json ]; then
             jq -r '.devices | keys[]' existing/manifest.json > /tmp/old_codenames.txt
             jq -r '.[].codename' out/report.json > /tmp/new_codenames.txt
-            comm -23 <(sort /tmp/old_codenames.txt) <(sort /tmp/new_codenames.txt) > out/stale.json.raw
+            comm -23 <(sort /tmp/old_codenames.txt) <(sort /tmp/new_codenames.txt) > out/stale.json.raw || true
             jq -R -s 'split("\n") | map(select(length > 0))' out/stale.json.raw > out/stale.json
           else
             echo '[]' > out/stale.json
@@ -632,6 +632,8 @@ jobs:
           echo "=== Summary (first 80) ==="
           jq -r '.[0:80] | .[] | "[\(.action)] \(.devicemodel) (\(.codename)): \(.reason)"' out/report.json || true
 
+          rm -rf repo /tmp/od-*.tar.gz
+
       - name: Upload report
         uses: actions/upload-artifact@v4
         with:
@@ -654,9 +656,6 @@ jobs:
 
   # ============================================================
   # JOB 2: CONVERT
-  # Downloads pre-built erofs-utils and otaripper from setup
-  # artifacts. Installs apt packages (cached). Reads matrix.json
-  # from the report artifact to get exact per-device fields.
   # ============================================================
   convert:
     name: Convert ${{ matrix.codename }}
@@ -1711,9 +1710,6 @@ jobs:
 
   # ============================================================
   # JOB 3: PUBLISH
-  # Collects per-device artifacts and updates single "sync" release.
-  # Incremental: uploads only new/updated assets, keeps old ones.
-  # Merges manifest.json with existing one.
   # ============================================================
   publish:
     name: Publish sync release
