@@ -1,0 +1,1177 @@
+name: Sync Vanilla for Project Infinity-X
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only discover and report, do not convert'
+        type: boolean
+        default: true
+      device_filter:
+        description: 'Comma-separated codenames (empty = all)'
+        required: false
+        default: ''
+      force_rebuild:
+        description: 'Ignore manifest, rebuild everything'
+        type: boolean
+        default: false
+      prune_stale:
+        description: 'Remove devices no longer present from the sync release'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  SYNC_TAG: sync
+  WORK_ROOT: /mnt/work
+
+jobs:
+  # ============================================================
+  # JOB 1: DISCOVER
+  # Scans official_devices repository (branches 17, 16, master),
+  # builds report and matrix of devices that need conversion.
+  # Uses manifest.json from existing "sync" release for incremental.
+  # ============================================================
+  discover:
+    name: Discover devices
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.scan.outputs.matrix }}
+      count: ${{ steps.scan.outputs.count }}
+      has_jobs: ${{ steps.scan.outputs.has_jobs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Fetch existing sync release manifest
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p existing
+          if gh release view "$SYNC_TAG" --repo "$REPO" &>/dev/null; then
+            echo "Release '$SYNC_TAG' exists"
+            gh release view "$SYNC_TAG" --repo "$REPO" --json assets \
+              -q '.assets[].name' > existing/assets.txt
+            echo "Existing assets:"
+            cat existing/assets.txt || true
+            if grep -qx 'manifest.json' existing/assets.txt; then
+              gh release download "$SYNC_TAG" --repo "$REPO" \
+                --pattern 'manifest.json' --dir existing
+              echo "has_manifest=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_manifest=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Release '$SYNC_TAG' does not exist yet"
+            touch existing/assets.txt
+            echo "has_manifest=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Scan official_devices and build matrix
+        id: scan
+        env:
+          FILTER: ${{ inputs.device_filter }}
+          FORCE: ${{ inputs.force_rebuild }}
+          PRUNE: ${{ inputs.prune_stale }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          python3 - <<'PY' > out/report.json
+          import json, os, re, sys
+          from datetime import datetime, timezone
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          UA = {"User-Agent": "Mozilla/5.0 projectinfinity-sync/1.0"}
+          REPO = "ProjectInfinity-X/official_devices"
+          BRANCHES = ["17", "16", "master"]
+          API_CONTENTS = f"https://api.github.com/repos/{REPO}/contents/devices?ref={{branch}}"
+          RAW = "https://raw.githubusercontent.com/{repo}/{branch}/"
+
+          def fetch_json(url):
+              try:
+                  with urlopen(Request(url, headers=UA), timeout=60) as r:
+                      return json.loads(r.read())
+              except HTTPError as e:
+                  if e.code == 404:
+                      return None
+                  return None
+              except Exception:
+                  return None
+
+          def list_devices():
+              seen = {}
+              for br in BRANCHES:
+                  data = fetch_json(API_CONTENTS.format(branch=br))
+                  if not data:
+                      continue
+                  for f in data:
+                      name = f.get("name", "")
+                      if name.endswith(".json"):
+                          cn = name[:-5]
+                          if cn not in seen:
+                              seen[cn] = br
+              return seen
+
+          def build_info(branch, kind, codename):
+              data = fetch_json(RAW.format(repo=REPO, branch=branch) + f"{kind}/{codename}.json")
+              if not data:
+                  return None
+              resp = data.get("response")
+              if isinstance(resp, list) and resp:
+                  return resp[0]
+              return None
+
+          def device_info(branch, codename):
+              data = fetch_json(RAW.format(repo=REPO, branch=branch) + f"devices/{codename}.json")
+              return data or {}
+
+          def norm_version(v):
+              return str(v).strip() if v else ""
+
+          def ts_human(ts):
+              if not ts:
+                  return "-"
+              try:
+                  return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+              except Exception:
+                  return str(ts)
+
+          def ts_from_filename(fn):
+              if not fn:
+                  return ""
+              m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", fn)
+              return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else ""
+
+          devices = list_devices()
+          report = []
+          matrix = []
+          stale = []
+
+          filt = set(x.strip() for x in os.environ.get("FILTER", "").split(",") if x.strip())
+          force = os.environ.get("FORCE", "false") == "true"
+
+          existing_manifest = {}
+          if not force and os.path.isfile("existing/manifest.json"):
+              try:
+                  existing_manifest = json.load(open("existing/manifest.json")).get("devices", {})
+              except Exception:
+                  existing_manifest = {}
+
+          for cn, branch in sorted(devices.items()):
+              if filt and cn not in filt:
+                  continue
+
+              g = build_info(branch, "gapps", cn)
+              v = build_info(branch, "vanilla", cn)
+              di = device_info(branch, cn)
+              devicemodel = di.get("devicemodel", "") or cn
+              maintainer = di.get("maintainer", "")
+
+              entry = {
+                  "codename": cn,
+                  "devicemodel": devicemodel,
+                  "maintainer": maintainer,
+                  "branch": branch,
+                  "gapps": {
+                      "exists": bool(g),
+                      "version": norm_version(g.get("version")) if g else "",
+                      "timestamp": int(g.get("timestamp") or 0) if g else 0,
+                      "date": ts_human(g.get("timestamp") if g else None),
+                      "filename": (g or {}).get("filename", ""),
+                      "download": (g or {}).get("download", ""),
+                      "md5": (g or {}).get("md5", ""),
+                      "size": int((g or {}).get("size") or 0) if g else 0,
+                  },
+                  "vanilla": {
+                      "exists": bool(v),
+                      "version": norm_version(v.get("version")) if v else "",
+                      "timestamp": int(v.get("timestamp") or 0) if v else 0,
+                      "date": ts_human(v.get("timestamp") if v else None),
+                      "filename": (v or {}).get("filename", ""),
+                      "download": (v or {}).get("download", ""),
+                      "md5": (v or {}).get("md5", ""),
+                      "size": int((v or {}).get("size") or 0) if v else 0,
+                  },
+                  "publish": False,
+                  "action": "skip",
+                  "reason": "",
+              }
+
+              if not g:
+                  entry["reason"] = "no gapps build"
+                  report.append(entry)
+                  continue
+
+              if not v:
+                  entry["reason"] = "no vanilla build"
+                  action = "new"
+                  publish = True
+              elif norm_version(g.get("version")) == norm_version(v.get("version")):
+                  entry["reason"] = f"vanilla exists with same version {norm_version(v.get('version'))}"
+                  entry["publish"] = False
+                  entry["action"] = "skip"
+                  report.append(entry)
+                  continue
+              else:
+                  entry["reason"] = (
+                      f"vanilla exists but different version "
+                      f"(gapps={norm_version(g.get('version'))}, "
+                      f"vanilla={norm_version(v.get('version'))})"
+                  )
+                  action = "update"
+                  publish = True
+
+              old = existing_manifest.get(cn)
+              if old and not force:
+                  same = (
+                      old.get("gapps_md5") == entry["gapps"]["md5"]
+                      and old.get("version") == entry["gapps"]["version"]
+                      and old.get("build_status") == "ok"
+                  )
+                  if same:
+                      entry["publish"] = False
+                      entry["action"] = "skip"
+                      entry["reason"] = "unchanged since last sync"
+                      report.append(entry)
+                      continue
+                  else:
+                      action = "update"
+                      entry["reason"] = (
+                          f"changed: version {old.get('version')}->{entry['gapps']['version']}, "
+                          f"md5 {old.get('gapps_md5', '?')[:8]}->{entry['gapps']['md5'][:8]}"
+                      )
+              elif not old:
+                  action = "new"
+
+              entry["publish"] = True
+              entry["action"] = action
+              report.append(entry)
+
+              version = entry["gapps"]["version"]
+              date_tag = ts_from_filename(entry["gapps"]["filename"])
+              matrix.append({
+                  "codename": cn,
+                  "devicemodel": devicemodel,
+                  "branch": branch,
+                  "version": version,
+                  "date_tag": date_tag,
+                  "release_tag": f"{cn}-vanilla-{version}-{date_tag}".rstrip("-"),
+                  "gapps_url": entry["gapps"]["download"],
+                  "vanilla_url": entry["vanilla"]["download"] if v else "",
+                  "gapps_timestamp": entry["gapps"]["timestamp"],
+                  "vanilla_timestamp": entry["vanilla"]["timestamp"],
+                  "gapps_filename": entry["gapps"]["filename"],
+                  "vanilla_filename": entry["vanilla"]["filename"],
+                  "gapps_md5": entry["gapps"]["md5"],
+                  "reason": entry["reason"],
+              })
+
+          for cn in existing_manifest:
+              if cn not in [r["codename"] for r in report]:
+                  stale.append(cn)
+
+          print(json.dumps(report, indent=2, ensure_ascii=False))
+          PY
+
+          jq '[.[] | select(.publish == true)]' out/report.json > out/matrix.json
+          jq '[.[] | select(.publish == false)]' out/report.json > out/skipped.json
+
+          # Build stale list
+          if [ -f existing/manifest.json ]; then
+            jq -r '.devices | keys[]' existing/manifest.json > /tmp/old_codenames.txt
+            jq -r '.[].codename' out/report.json > /tmp/new_codenames.txt
+            comm -23 <(sort /tmp/old_codenames.txt) <(sort /tmp/new_codenames.txt) > out/stale.json.raw
+            jq -R -s 'split("\n") | map(select(length > 0))' out/stale.json.raw > out/stale.json
+          else
+            echo '[]' > out/stale.json
+          fi
+
+          # Build markdown report
+          python3 - <<'PY' > out/report.md
+          import json
+          from datetime import datetime, timezone
+
+          report = json.load(open("out/report.json"))
+          stale = json.load(open("out/stale.json"))
+
+          publish = [r for r in report if r["publish"]]
+          skipped = [r for r in report if not r["publish"]]
+
+          print("# Project Infinity-X — Vanilla sync report")
+          print()
+          print(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+          print()
+          print("## Summary")
+          print()
+          print(f"- Total devices: **{len(report)}**")
+          print(f"- Will publish (convert): **{len(publish)}**")
+          print(f"- Skipped: **{len(skipped)}**")
+          print(f"- Stale (no longer present): **{len(stale)}**")
+          print()
+          print("## Devices to publish")
+          print()
+          print("| # | Model | Codename | Branch | GApps ver | Vanilla ver | Reason |")
+          print("|---|---|---|---|---|---|---|")
+          for i, r in enumerate(publish, 1):
+              print(f"| {i} | {r['devicemodel']} | `{r['codename']}` | {r['branch']} | "
+                    f"{r['gapps']['version'] or '-'} | {r['vanilla']['version'] or '-'} | {r['reason']} |")
+          print()
+          print("## Devices skipped")
+          print()
+          print("| # | Model | Codename | Branch | GApps ver | Vanilla ver | Reason |")
+          print("|---|---|---|---|---|---|---|")
+          for i, r in enumerate(skipped, 1):
+              print(f"| {i} | {r['devicemodel']} | `{r['codename']}` | {r['branch']} | "
+                    f"{r['gapps']['version'] or '-'} | {r['vanilla']['version'] or '-'} | {r['reason']} |")
+          if stale:
+              print()
+              print("## Stale devices (not in current scan)")
+              print()
+              for cn in stale:
+                  print(f"- `{cn}`")
+          PY
+
+          COUNT=$(jq 'length' out/matrix.json)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          if [ "$COUNT" -gt 0 ]; then
+            echo "matrix=$(jq -c '.' out/matrix.json)" >> $GITHUB_OUTPUT
+            echo "has_jobs=true" >> $GITHUB_OUTPUT
+          else
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            echo "has_jobs=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "=== Summary ==="
+          jq -r '.[] | "[\(.action)] \(.devicemodel) (\(.codename)): \(.reason)"' out/report.json | head -50
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: |
+            out/report.json
+            out/report.md
+            out/matrix.json
+            out/skipped.json
+            out/stale.json
+          retention-days: 30
+
+      - name: Print report to summary
+        run: |
+          echo "## Discovery complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat out/report.md >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # JOB 2: CONVERT
+  # For each device in matrix: download GApps + Vanilla,
+  # extract partitions, apply diff, rebuild images.
+  # Uploads per-device artifacts (no GitHub Release here).
+  # ============================================================
+  convert:
+    name: Convert ${{ matrix.codename }}
+    needs: discover
+    if: |
+      !inputs.dry_run
+      && needs.discover.outputs.has_jobs == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      WORK_ROOT: /mnt/work
+      CN: ${{ matrix.codename }}
+      MODEL: ${{ matrix.devicemodel }}
+      VER: ${{ matrix.version }}
+      GAPPS_URL: ${{ matrix.gapps_url }}
+      VANILLA_URL: ${{ matrix.vanilla_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            erofs-utils e2fsprogs android-sdk-libsparse-utils brotli zip unzip \
+            xz-utils attr acl p7zip-full curl wget jq file rsync \
+            build-essential liblz4-dev liblzma-dev libzstd-dev uuid-dev \
+            libselinux1-dev libfuse-dev pkg-config autoconf automake libtool \
+            python3 python3-pip
+
+      - name: Create working directories
+        run: |
+          sudo mkdir -p "$WORK_ROOT"
+          sudo chown $USER:$USER "$WORK_ROOT"
+          mkdir -p "$WORK_ROOT/gapps" "$WORK_ROOT/vanilla" "$WORK_ROOT/work" \
+                   "$WORK_ROOT/otaripper" "$WORK_ROOT/erofs-utils-src" "$WORK_ROOT/tmp"
+          df -T "$WORK_ROOT"
+
+      - name: Build erofs-utils from source
+        run: |
+          set -e
+          SRC="$WORK_ROOT/erofs-utils-src"
+          git clone --depth=1 --branch v1.8.2 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git "$SRC"
+          cd "$SRC"
+          ./autogen.sh
+          ./configure --prefix=/usr/local --enable-fuse
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          which mkfs.erofs fsck.erofs dump.erofs extract.erofs || true
+
+      - name: Install otaripper
+        run: |
+          set -e
+          URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux-static-x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          [ -z "$URL" ] && URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux.*x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          echo "otaripper: $URL"
+          mkdir -p "$WORK_ROOT/otaripper"
+          curl -L -o "$WORK_ROOT/otaripper.tar.gz" "$URL"
+          tar --no-same-owner --no-same-permissions -xzf "$WORK_ROOT/otaripper.tar.gz" -C "$WORK_ROOT/otaripper" || true
+          BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' -executable | head -1)
+          [ -z "$BIN" ] && BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' | head -1)
+          sudo cp "$BIN" /usr/local/bin/otaripper
+          sudo chmod +x /usr/local/bin/otaripper
+          otaripper --version 2>&1 | head -3 || true
+
+      - name: Download GApps firmware
+        run: |
+          echo "GApps: $GAPPS_URL"
+          curl -L --retry 5 --retry-delay 5 --retry-connrefused \
+            -o "$WORK_ROOT/gapps/image" "$GAPPS_URL"
+          ls -lh "$WORK_ROOT/gapps/image"
+
+      - name: Download Vanilla firmware
+        run: |
+          if [ -z "$VANILLA_URL" ]; then
+            echo "No vanilla URL, skipping download (will use gapps-only mode)"
+            exit 0
+          fi
+          echo "Vanilla: $VANILLA_URL"
+          curl -L --retry 5 --retry-delay 5 --retry-connrefused \
+            -o "$WORK_ROOT/vanilla/image" "$VANILLA_URL"
+          ls -lh "$WORK_ROOT/vanilla/image"
+
+      - name: Extract GApps archive and payload.bin
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/gapps"
+          mkdir -p extracted
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "GApps: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "GApps: xz OK"
+            [ -f image ] && mv image extracted/system.img
+          else
+            echo "GApps: raw image, treating as system.img"
+            mv image extracted/system.img
+          fi
+
+          if [ -f extracted/payload.bin ]; then
+            mkdir -p extracted/images
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || {
+              otaripper extracted/payload.bin -o extracted/images || true
+            }
+            find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
+          fi
+
+          if find extracted -maxdepth 1 -name '*.new.dat.br' -print -quit | grep -q .; then
+            sudo apt-get install -y brotli python3-pip >/dev/null
+            pip3 install --quiet --break-system-packages sdat2img || \
+              pip3 install --quiet sdat2img || true
+            SDAT2IMG=$(command -v sdat2img || command -v sdat2img.py || true)
+            if [ -z "$SDAT2IMG" ]; then
+              curl -fsSL -o "$WORK_ROOT/tmp/sdat2img.py" \
+                https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
+              chmod +x "$WORK_ROOT/tmp/sdat2img.py"
+              SDAT2IMG="$WORK_ROOT/tmp/sdat2img.py"
+            fi
+            for part in system system_ext product vendor; do
+              local_br="extracted/${part}.new.dat.br"
+              local_dat="extracted/${part}.new.dat"
+              local_tl="extracted/${part}.transfer.list"
+              local_img="extracted/${part}.img"
+              if [ -f "$local_br" ] && [ -f "$local_tl" ]; then
+                brotli -d -f -o "$local_dat" "$local_br"
+                python3 "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img" 2>/dev/null || \
+                  "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img"
+                rm -f "$local_dat"
+              fi
+            done
+          fi
+
+          echo "=== GApps extracted ==="
+          ls -lh extracted/
+
+      - name: Extract Vanilla archive and payload.bin
+        if: env.VANILLA_URL != ''
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/vanilla"
+          mkdir -p extracted
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "Vanilla: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "Vanilla: xz OK"
+            [ -f image ] && mv image extracted/system.img
+          else
+            echo "Vanilla: raw image, treating as system.img"
+            mv image extracted/system.img
+          fi
+
+          if [ -f extracted/payload.bin ]; then
+            mkdir -p extracted/images
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || {
+              otaripper extracted/payload.bin -o extracted/images || true
+            }
+            find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
+          fi
+
+          if find extracted -maxdepth 1 -name '*.new.dat.br' -print -quit | grep -q .; then
+            sudo apt-get install -y brotli python3-pip >/dev/null
+            pip3 install --quiet --break-system-packages sdat2img || \
+              pip3 install --quiet sdat2img || true
+            SDAT2IMG=$(command -v sdat2img || command -v sdat2img.py || true)
+            if [ -z "$SDAT2IMG" ]; then
+              curl -fsSL -o "$WORK_ROOT/tmp/sdat2img.py" \
+                https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
+              chmod +x "$WORK_ROOT/tmp/sdat2img.py"
+              SDAT2IMG="$WORK_ROOT/tmp/sdat2img.py"
+            fi
+            for part in system system_ext product vendor; do
+              local_br="extracted/${part}.new.dat.br"
+              local_dat="extracted/${part}.new.dat"
+              local_tl="extracted/${part}.transfer.list"
+              local_img="extracted/${part}.img"
+              if [ -f "$local_br" ] && [ -f "$local_tl" ]; then
+                brotli -d -f -o "$local_dat" "$local_br"
+                python3 "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img" 2>/dev/null || \
+                  "$SDAT2IMG" "$local_tl" "$local_dat" "$local_img"
+                rm -f "$local_dat"
+              fi
+            done
+          fi
+
+          echo "=== Vanilla extracted ==="
+          ls -lh extracted/
+
+      - name: Extract partitions from images
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+
+          extract_image() {
+            local img="$1"
+            local out="$2"
+            mkdir -p "$out"
+            echo "  Image: $img"
+
+            if fsck.erofs --extract="$out" --xattrs --preserve "$img" >/dev/null 2>&1; then
+              echo "  OK: fsck.erofs"
+              return 0
+            fi
+            if command -v extract.erofs >/dev/null 2>&1; then
+              if extract.erofs -x -i "$img" -o "$out" >/dev/null 2>&1; then
+                echo "  OK: extract.erofs"
+                return 0
+              fi
+            fi
+            local mnt="$WORK_ROOT/tmp/mnt_$$"
+            rm -rf "$mnt"; mkdir -p "$mnt"
+            if sudo mount -o loop,ro "$img" "$mnt" >/dev/null 2>&1; then
+              sudo rsync -aHAX --numeric-ids --exclude=lost+found "$mnt"/ "$out"/ || \
+                sudo cp -a "$mnt"/. "$out"/
+              sudo umount "$mnt" || sudo umount -l "$mnt" || true
+              sudo chown -R $USER:$USER "$out" || true
+              rm -rf "$mnt"
+              return 0
+            fi
+            rm -rf "$mnt"
+            if command -v debugfs >/dev/null 2>&1; then
+              if debugfs -R "rdump / $out" "$img" >/dev/null 2>&1; then
+                sudo chown -R $USER:$USER "$out" || true
+                return 0
+              fi
+            fi
+            if simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
+              extract_image "${img}.raw" "$out"
+              return $?
+            fi
+            echo "  ERROR: unable to extract $img"
+            return 1
+          }
+
+          find_part_img() {
+            local side="$1" part="$2"
+            find "$WORK_ROOT/$side/extracted" -type f \
+              \( -name "${part}.img" -o -name "${part}_a.img" -o -name "${part}_b.img" \) \
+              2>/dev/null | head -1
+          }
+
+          FAIL=0
+          echo "=== Extracting GApps partitions ==="
+          for part in system system_ext product; do
+            img=$(find_part_img gapps "$part")
+            if [ -n "$img" ]; then
+              extract_image "$img" "gapps_${part}_raw" || { echo "ERROR: gapps/${part}"; FAIL=1; }
+            else
+              echo "ERROR: GApps ${part}.img not found"
+              FAIL=1
+            fi
+          done
+
+          if [ -d "$WORK_ROOT/vanilla/extracted" ]; then
+            echo "=== Extracting Vanilla partitions ==="
+            for part in system system_ext product; do
+              img=$(find_part_img vanilla "$part")
+              if [ -n "$img" ]; then
+                extract_image "$img" "vanilla_${part}_raw" || { echo "ERROR: vanilla/${part}"; FAIL=1; }
+              else
+                echo "ERROR: Vanilla ${part}.img not found"
+                FAIL=1
+              fi
+            done
+          fi
+
+          ls -la
+          if [ "$FAIL" -ne 0 ]; then
+            echo "FATAL: missing partitions"
+            exit 1
+          fi
+
+      - name: Log source image sizes before
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          echo "=== Source .img sizes (before) ===" | tee sizes_before.txt
+          for side in gapps vanilla; do
+            for part in system system_ext product; do
+              img=$(find "$WORK_ROOT/$side/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+              if [ -n "$img" ] && [ -f "$img" ]; then
+                RAW=$(stat -c %s "$img")
+                printf '%-7s %-11s %12s bytes  %s\n' "$side" "$part" "$RAW" "$img" | tee -a sizes_before.txt
+              fi
+            done
+          done
+
+      - name: Apply GApps to Vanilla diff
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+
+          MISSING=0
+          for part in system system_ext product; do
+            [ -d "gapps_${part}_raw" ] || { echo "ERROR: gapps_${part}_raw missing"; MISSING=1; }
+          done
+          if [ -d "$WORK_ROOT/vanilla/extracted" ]; then
+            for part in system system_ext product; do
+              [ -d "vanilla_${part}_raw" ] || { echo "ERROR: vanilla_${part}_raw missing"; MISSING=1; }
+            done
+          fi
+          if [ "$MISSING" -ne 0 ]; then
+            echo "FATAL: raw trees incomplete"
+            exit 1
+          fi
+
+          is_protected() {
+            case "$1" in
+              build.prop) return 0 ;;
+              */build.prop) return 0 ;;
+            esac
+            return 1
+          }
+
+          copy_preserve_xattr() {
+            local src="$1" dst="$2"
+            mkdir -p "$(dirname "$dst")"
+            if [ ! -r "$src" ]; then
+              sudo cp -a --preserve=all "$src" "$dst" 2>/dev/null || return 1
+              sudo chown $USER:$USER "$dst" || true
+            else
+              cp -a --preserve=all "$src" "$dst" 2>/dev/null || cp -a "$src" "$dst"
+            fi
+          }
+
+          file_sig() {
+            local f="$1"
+            local sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+            if [ "$sz" -lt 67108864 ]; then
+              sha256sum "$f" 2>/dev/null | awk '{print "sha256:"$1}'
+            else
+              stat -c "size:%s:mtime:%Y" "$f" 2>/dev/null
+            fi
+          }
+
+          build_manifest() {
+            local root="$1" out="$2"
+            : > "$out"
+            [ -d "$root" ] || return 0
+            ( cd "$root" && find . -mindepth 1 \
+                -not -path './lost+found' -not -path './lost+found/*' \
+                \( -type f -o -type l -o -type d \) -print0 ) \
+              | while IFS= read -r -d '' p; do
+                  rel="${p#./}"
+                  if [ -L "$root/$rel" ]; then
+                    printf 'L\t%s\t%s\n' "$rel" "$(readlink "$root/$rel")"
+                  elif [ -f "$root/$rel" ]; then
+                    printf 'F\t%s\t%s\n' "$rel" "$(file_sig "$root/$rel")"
+                  elif [ -d "$root/$rel" ]; then
+                    printf 'D\t%s\t-\n' "$rel"
+                  fi
+                done >> "$out"
+            sort -t $'\t' -k2,2 "$out" -o "$out"
+          }
+
+          size_of() {
+            local p="$1"
+            if [ -L "$p" ]; then printf 'link'
+            elif [ -f "$p" ]; then stat -c %s "$p" 2>/dev/null || echo 0
+            elif [ -d "$p" ]; then printf 'dir'
+            else printf 'absent'
+            fi
+          }
+
+          apply_part_diff() {
+            local part="$1"
+            local gapps_dir="gapps_${part}_raw"
+            local vanilla_dir="vanilla_${part}_raw"
+            [ -d "$gapps_dir" ] || { echo "SKIP $part: no gapps dir"; return 0; }
+
+            local log="diff_${part}.log"
+            : > "$log"
+            {
+              echo "# part=${part}"
+              echo "# columns: action  rel_path  old_bytes  new_bytes"
+            } >> "$log"
+
+            echo "=== Diff $part ==="
+            build_manifest "$gapps_dir"   "manifest_g_${part}.tsv"
+
+            if [ -d "$vanilla_dir" ]; then
+              build_manifest "$vanilla_dir" "manifest_v_${part}.tsv"
+
+              awk -F'\t' '
+                NR==FNR { v[$2]=1; next }
+                ($1=="F"||$1=="L") && !($2 in v) { print $1"\t"$2 }
+              ' "manifest_v_${part}.tsv" "manifest_g_${part}.tsv" > "only_g_${part}.tsv"
+
+              awk -F'\t' '
+                NR==FNR { g[$2]=1; next }
+                ($1=="F"||$1=="L") && !($2 in g) { print $1"\t"$2 }
+              ' "manifest_g_${part}.tsv" "manifest_v_${part}.tsv" > "only_v_${part}.tsv"
+
+              awk -F'\t' '
+                NR==FNR { gh[$2]=$3; gt[$2]=$1; next }
+                ($1=="F") && (($2 in gh)) && (gt[$2]=="F") && (gh[$2] != $3) { print "F\t"$2 }
+              ' "manifest_g_${part}.tsv" "manifest_v_${part}.tsv" > "diff_${part}.tsv"
+
+              while IFS=$'\t' read -r t rel; do
+                [ -z "$rel" ] && continue
+                is_protected "$rel" && continue
+                rm -f "$gapps_dir/$rel"
+                printf 'REMOVED\t%s\t0\t0\n' "$rel" >> "$log"
+              done < "only_g_${part}.tsv"
+
+              while IFS=$'\t' read -r t rel; do
+                [ -z "$rel" ] && continue
+                copy_preserve_xattr "$vanilla_dir/$rel" "$gapps_dir/$rel" || true
+                printf 'ADDED\t%s\t0\t0\n' "$rel" >> "$log"
+              done < "only_v_${part}.tsv"
+
+              while IFS=$'\t' read -r t rel; do
+                [ -z "$rel" ] && continue
+                is_protected "$rel" && continue
+                copy_preserve_xattr "$vanilla_dir/$rel" "$gapps_dir/$rel" || true
+                printf 'REPLACED\t%s\t0\t0\n' "$rel" >> "$log"
+              done < "diff_${part}.tsv"
+            fi
+          }
+
+          for part in system system_ext product; do
+            apply_part_diff "$part"
+          done
+
+      - name: Detect original UUIDs and formats
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          for part in system system_ext product; do
+            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ] && [ -f "$img" ]; then
+              if dump.erofs -s "$img" >/dev/null 2>&1; then
+                UUID=$(dump.erofs -s "$img" 2>/dev/null | grep -oP 'UUID:\s*\K[0-9a-f-]+' | head -1 || true)
+                echo "$UUID" > "${part}_uuid.txt"
+                echo "erofs" > "${part}_format.txt"
+              elif blkid -o value -s UUID "$img" >/dev/null 2>&1; then
+                UUID=$(blkid -o value -s UUID "$img" 2>/dev/null || true)
+                echo "$UUID" > "${part}_uuid.txt"
+                echo "ext4" > "${part}_format.txt"
+              else
+                echo "" > "${part}_uuid.txt"
+                echo "erofs" > "${part}_format.txt"
+              fi
+            else
+              echo "" > "${part}_uuid.txt"
+              echo "erofs" > "${part}_format.txt"
+            fi
+          done
+
+      - name: Detect EROFS parameters
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          for part in system system_ext product; do
+            echo "-zlz4hc -b4096 -C65536" > "${part}_erofs_params.txt"
+          done
+
+      - name: Rebuild images
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          build_erofs() {
+            local raw="$1" out="$2" uuid="$3" params_file="$4"
+            local opts=$(cat "$params_file" 2>/dev/null || echo "-zlz4hc -b4096 -C65536")
+            if [ -n "$uuid" ]; then
+              mkfs.erofs $opts -U "$uuid" "$out" "$raw"
+            else
+              mkfs.erofs $opts "$out" "$raw"
+            fi
+          }
+
+          build_ext4() {
+            local raw="$1" out="$2" uuid="$3"
+            local size=$(du -sb "$raw" | awk '{print $1}')
+            size=$((size + size / 10 + 16*1024*1024))
+            truncate -s "$size" "$out"
+            if [ -n "$uuid" ]; then
+              mkfs.ext4 -F -U "$uuid" -d "$raw" "$out"
+            else
+              mkfs.ext4 -F -d "$raw" "$out"
+            fi
+          }
+
+          for part in system system_ext product; do
+            raw="gapps_${part}_raw"
+            fmt=$(cat "${part}_format.txt" 2>/dev/null || echo "erofs")
+            uuid=$(cat "${part}_uuid.txt" 2>/dev/null || echo "")
+            params_file="${part}_erofs_params.txt"
+            [ -d "$raw" ] || { echo "SKIP $part (no raw)"; continue; }
+            echo "=== Building ${part} (format=$fmt) ==="
+            if [ "$fmt" = "ext4" ]; then
+              build_ext4 "$raw" "${part}.img" "$uuid"
+            else
+              build_erofs "$raw" "${part}.img" "$uuid" "$params_file"
+            fi
+            file "${part}.img"
+            ls -lh "${part}.img"
+          done
+
+      - name: Create recovery flashable ZIP
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          mkdir -p zip/META-INF/com/google/android
+          cp system.img zip/system.img
+          cp system_ext.img zip/system_ext.img
+          cp product.img zip/product.img
+
+          cat > zip/META-INF/com/google/android/update-binary <<'EOF'
+          #!/sbin/sh
+          OUTFD=$2
+          ui_print() { echo "ui_print $1" >&$OUTFD; echo "ui_print" >&$OUTFD; }
+          flash_image() {
+            local img="$1" part="$2"
+            [ -f "$img" ] || { ui_print "WARNING: $img missing"; return; }
+            ui_print "Flashing $part"
+            dd if="$img" of="/dev/block/by-name/$part" bs=1M 2>/dev/null || \
+              dd if="$img" of="/dev/block/bootdevice/by-name/$part" bs=1M 2>/dev/null || \
+              ui_print "ERROR: failed $part"
+          }
+          ui_print "=== Vanilla flash ==="
+          flash_image "system.img" "system"
+          flash_image "system_ext.img" "system_ext"
+          flash_image "product.img" "product"
+          ui_print "=== Done, reboot ==="
+          EOF
+          chmod +x zip/META-INF/com/google/android/update-binary
+
+          cat > zip/META-INF/com/google/android/updater-script <<'EOF'
+          package_extract_file("system.img", "/tmp/system.img");
+          package_extract_file("system_ext.img", "/tmp/system_ext.img");
+          package_extract_file("product.img", "/tmp/product.img");
+          run_program("/sbin/sh", "/tmp/update-binary", "3", "1", "/tmp/updater-script");
+          EOF
+
+          cd zip
+          zip -r -9 "../${CN}-convert-to-vanilla.zip" . -x "*.git*"
+          cd ..
+          ls -lh "${CN}-convert-to-vanilla.zip"
+
+          # Rename with codename prefix
+          for f in system.img system_ext.img product.img "${CN}-convert-to-vanilla.zip"; do
+            [ -f "$f" ] && mv "$f" "${CN}-$f" 2>/dev/null || true
+          done
+          ls -lh
+
+      - name: Upload device artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanilla-images-${{ matrix.codename }}
+          path: |
+            /mnt/work/work/${{ matrix.codename }}-system.img
+            /mnt/work/work/${{ matrix.codename }}-system_ext.img
+            /mnt/work/work/${{ matrix.codename }}-product.img
+            /mnt/work/work/${{ matrix.codename }}-convert-to-vanilla.zip
+          retention-days: 7
+
+      - name: Upload diff logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-logs-${{ matrix.codename }}
+          path: |
+            /mnt/work/work/diff_*.log
+            /mnt/work/work/sizes_before.txt
+            /mnt/work/work/*_format.txt
+            /mnt/work/work/*_uuid.txt
+            /mnt/work/work/*_erofs_params.txt
+          retention-days: 7
+
+  # ============================================================
+  # JOB 3: PUBLISH
+  # Collects per-device artifacts, updates single "sync" release:
+  #   - uploads new/updated assets with --clobber
+  #   - merges manifest.json with existing
+  #   - edits release notes with full device list
+  #   - optionally prunes stale devices
+  # ============================================================
+  publish:
+    name: Publish sync release
+    needs: [discover, convert]
+    if: |
+      !inputs.dry_run
+      && always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download per-device artifacts
+        if: needs.discover.outputs.has_jobs == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vanilla-images-*
+          path: all
+          merge-multiple: false
+
+      - name: Download report
+        uses: actions/download-artifact@v4
+        with:
+          name: report
+          path: report
+
+      - name: Download existing sync manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p existing
+          if gh release view "$SYNC_TAG" --repo "$REPO" &>/dev/null; then
+            gh release view "$SYNC_TAG" --repo "$REPO" --json assets \
+              -q '.assets[].name' > existing/assets.txt
+            if grep -qx 'manifest.json' existing/assets.txt; then
+              gh release download "$SYNC_TAG" --repo "$REPO" \
+                --pattern 'manifest.json' --dir existing
+            fi
+          fi
+
+      - name: Build merged manifest.json
+        run: |
+          set -euo pipefail
+          mkdir -p publish
+          python3 - <<'PY'
+          import json, os, glob
+          from datetime import datetime, timezone
+
+          matrix = json.load(open("report/matrix.json")) if os.path.isfile("report/matrix.json") else []
+          old = {}
+          if os.path.isfile("existing/manifest.json"):
+              old = json.load(open("existing/manifest.json")).get("devices", {})
+
+          touched = {}
+          for item in matrix:
+              cn = item["codename"]
+              pattern = f"all/vanilla-images-{cn}/{cn}-*"
+              files = sorted(glob.glob(pattern))
+              assets = [os.path.basename(f) for f in files if os.path.isfile(f)]
+              touched[cn] = {
+                  "codename": cn,
+                  "devicemodel": item["devicemodel"],
+                  "branch": item["branch"],
+                  "version": item["version"],
+                  "gapps_filename": item["gapps_filename"],
+                  "gapps_md5": item.get("gapps_md5", ""),
+                  "gapps_timestamp": item["gapps_timestamp"],
+                  "vanilla_filename": item.get("vanilla_filename", ""),
+                  "vanilla_timestamp": item.get("vanilla_timestamp", 0),
+                  "assets": assets,
+                  "built_at": datetime.now(timezone.utc).isoformat(),
+                  "build_status": "ok",
+              }
+
+          merged = dict(old)
+          merged.update(touched)
+
+          manifest = {
+              "schema": 1,
+              "updated_at": datetime.now(timezone.utc).isoformat(),
+              "devices": merged,
+          }
+          json.dump(manifest, open("publish/manifest.json", "w"), indent=2, ensure_ascii=False)
+          print(f"Manifest: {len(merged)} total, {len(touched)} touched this run")
+          PY
+
+      - name: Build release_body.md
+        run: |
+          set -euo pipefail
+          {
+            echo "## Project Infinity-X — Vanilla sync"
+            echo ""
+            echo "**Updated:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "**Total devices:** $(jq '.devices | length' publish/manifest.json)"
+            echo "**Touched this run:** $(jq 'length' report/matrix.json)"
+            echo ""
+            echo "### All devices in this release"
+            echo ""
+            echo "| # | Model | Codename | Version | GApps file |"
+            echo "|---|---|---|---|---|"
+            jq -r '.devices | to_entries[] | [.value.devicemodel, .value.codename, .value.version, .value.gapps_filename] | @tsv' publish/manifest.json \
+              | sort -t$'\t' -k2 \
+              | awk -F'\t' '{i++; printf "| %d | %s | `%s` | %s | `%s` |\n", i, $1, $2, $3, $4}'
+            echo ""
+            echo "### New/updated in this run"
+            echo ""
+            echo "| # | Model | Codename | Version | Reason |"
+            echo "|---|---|---|---|---|"
+            jq -r '.[] | [.devicemodel, .codename, .version, .reason] | @tsv' report/matrix.json \
+              | awk -F'\t' '{i++; printf "| %d | %s | `%s` | %s | %s |\n", i, $1, $2, $3, $4}'
+          } > publish/release_body.md
+          cat publish/release_body.md
+
+      - name: Create sync release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$SYNC_TAG" --repo "$REPO" &>/dev/null; then
+            echo "Creating release '$SYNC_TAG'"
+            gh release create "$SYNC_TAG" \
+              --repo "$REPO" \
+              --title "Project Infinity-X — Vanilla sync" \
+              --notes-file publish/release_body.md
+          fi
+
+      - name: Upload new/updated assets with --clobber
+        if: needs.discover.outputs.has_jobs == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in all/vanilla-images-*/*; do
+            [ -f "$f" ] || continue
+            echo "Uploading: $f"
+            gh release upload "$SYNC_TAG" "$f" --clobber --repo "$REPO"
+          done
+
+      - name: Upload updated manifest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release upload "$SYNC_TAG" publish/manifest.json --clobber --repo "$REPO"
+
+      - name: Update release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release edit "$SYNC_TAG" \
+            --repo "$REPO" \
+            --notes-file publish/release_body.md
+
+      - name: Prune stale assets
+        if: ${{ inputs.prune_stale }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          STALE=$(jq -r '.[]' report/stale.json 2>/dev/null || echo "")
+          if [ -z "$STALE" ]; then
+            echo "No stale devices"
+            exit 0
+          fi
+          gh release view "$SYNC_TAG" --repo "$REPO" --json assets -q '.assets[].name' > all_assets.txt
+          for cn in $STALE; do
+            echo "Pruning: $cn"
+            grep -E "^${cn}-" all_assets.txt | while read -r asset; do
+              gh release delete-asset "$SYNC_TAG" "$asset" --repo "$REPO" --yes || true
+            done
+          done
+
+      - name: Write summary
+        run: |
+          {
+            echo "## Sync complete"
+            echo ""
+            echo "**Total in release:** $(jq '.devices | length' publish/manifest.json)"
+            echo "**Touched this run:** $(jq 'length' report/matrix.json)"
+            echo ""
+            echo "### New/updated"
+            jq -r '.[] | "- \(.devicemodel) (`\(.codename)`) v\(.version) — \(.reason)"' report/matrix.json
+          } >> $GITHUB_STEP_SUMMARY
