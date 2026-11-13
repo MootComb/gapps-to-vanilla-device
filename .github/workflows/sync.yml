@@ -37,14 +37,11 @@ jobs:
   # JOB 0: SETUP
   # Runs ONCE. Builds erofs-utils, downloads otaripper,
   # warms apt cache. Uploads binaries as artifacts so convert
-  # jobs can just download them (~10 MB) instead of rebuilding.
+  # jobs can just download them instead of rebuilding.
   # ============================================================
   setup:
     name: Setup build tools
     runs-on: ubuntu-22.04
-    outputs:
-      erofs_artifact: erofs-utils-${{ env.EROFS_VERSION }}
-      otaripper_artifact: otaripper-bin
     steps:
       - name: Install system dependencies (cached)
         uses: awalsh128/cache-apt-pkgs-action@v1
@@ -87,7 +84,6 @@ jobs:
           mkdir -p /tmp/setup/otaripper
           cd /tmp/setup
 
-          # Try 1: GitHub API latest release
           URL=""
           if curl -fsSL --retry 3 --retry-delay 5 \
               -H "Accept: application/vnd.github+json" \
@@ -102,7 +98,6 @@ jobs:
             fi
           fi
 
-          # Try 2: fallback hardcoded URL (if API failed)
           if [ -z "$URL" ] || [ "$URL" = "null" ]; then
             echo "WARN: GitHub API failed, using fallback URL"
             URL="https://github.com/syedinsaf/otaripper/releases/latest/download/otaripper-linux-static-x86_64.tar.gz"
@@ -110,26 +105,23 @@ jobs:
 
           echo "otaripper URL: $URL"
 
-          # Download
           if ! curl -fL --retry 5 --retry-delay 5 --retry-connrefused \
               -o /tmp/setup/otaripper.tar.gz "$URL"; then
             echo "ERROR: failed to download otaripper from $URL"
-            echo "Listing available releases:"
-            curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases | jq -r '.[].assets[].name' || true
+            curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases \
+              | jq -r '.[].assets[].name' || true
             exit 1
           fi
 
           ls -lh /tmp/setup/otaripper.tar.gz
           file /tmp/setup/otaripper.tar.gz
 
-          # Extract
           tar --no-same-owner --no-same-permissions -xzf /tmp/setup/otaripper.tar.gz -C /tmp/setup/otaripper || {
             echo "ERROR: failed to extract otaripper.tar.gz"
             tar -tzf /tmp/setup/otaripper.tar.gz | head -20 || true
             exit 1
           }
 
-          # Find binary
           BIN=$(find /tmp/setup/otaripper -maxdepth 3 -type f -name 'otaripper*' -executable | head -1)
           if [ -z "$BIN" ]; then
             BIN=$(find /tmp/setup/otaripper -maxdepth 3 -type f -name 'otaripper*' | head -1)
@@ -151,6 +143,7 @@ jobs:
           echo "=== EROFS bin ==="
           ls -la /tmp/setup/erofs-utils/bin/
           /tmp/setup/erofs-utils/bin/mkfs.erofs 2>&1 | head -1 || true
+          /tmp/setup/erofs-utils/bin/fsck.erofs 2>&1 | head -1 || true
           echo "=== EROFS lib ==="
           ls -la /tmp/setup/erofs-utils/lib/ || true
           echo "=== otaripper ==="
@@ -328,7 +321,6 @@ jobs:
           filt = set(x.strip() for x in os.environ.get("FILTER", "").split(",") if x.strip())
           force = os.environ.get("FORCE", "false") == "true"
 
-          # -------- 1. Full picture for all devices --------
           all_info = {}
           for cn, branch in sorted(devices.items()):
               g = build_info(branch, "gapps", cn)
@@ -343,7 +335,6 @@ jobs:
                   "vanilla": v,
               }
 
-          # -------- 2. Donor index: version_tuple -> list of donors --------
           donors_by_version = {}
           for cn, info in all_info.items():
               v = info["vanilla"]
@@ -361,7 +352,6 @@ jobs:
                   "filename": v.get("filename", ""),
               })
 
-          # -------- 3. Decide for each device --------
           report = []
           matrix = []
           stale = []
@@ -418,7 +408,6 @@ jobs:
                   report.append(entry)
                   continue
 
-              # --- Case A: vanilla exists for the device itself, same version ---
               if v and norm_version(g.get("version")) == norm_version(v.get("version")):
                   entry["reason"] = f"vanilla exists with same version {norm_version(v.get('version'))}"
                   entry["publish"] = False
@@ -426,7 +415,6 @@ jobs:
                   report.append(entry)
                   continue
 
-              # --- Pick donor ---
               target_ver = version_tuple(g.get("version"))
               target_ts = int(g.get("timestamp") or 0)
 
@@ -630,12 +618,16 @@ jobs:
           COUNT=$(jq 'length' out/matrix.json)
           echo "count=$COUNT" >> $GITHUB_OUTPUT
           if [ "$COUNT" -gt 0 ]; then
-            echo "matrix=$(jq -c '.' out/matrix.json)" >> $GITHUB_OUTPUT
+            MATRIX_JSON=$(jq -c '.' out/matrix.json | tr -d '\n')
+            printf 'matrix=%s\n' "$MATRIX_JSON" >> "$GITHUB_OUTPUT"
             echo "has_jobs=true" >> $GITHUB_OUTPUT
           else
             echo "matrix=[]" >> $GITHUB_OUTPUT
             echo "has_jobs=false" >> $GITHUB_OUTPUT
           fi
+
+          echo "=== Matrix JSON (raw) ==="
+          cat out/matrix.json | jq '.'
 
           echo "=== Summary (first 80) ==="
           jq -r '.[0:80] | .[] | "[\(.action)] \(.devicemodel) (\(.codename)): \(.reason)"' out/report.json || true
@@ -663,8 +655,8 @@ jobs:
   # ============================================================
   # JOB 2: CONVERT
   # Downloads pre-built erofs-utils and otaripper from setup
-  # artifacts. Installs apt packages (cached). Then runs the
-  # full GApps -> Vanilla conversion for each device.
+  # artifacts. Installs apt packages (cached). Reads matrix.json
+  # from the report artifact to get exact per-device fields.
   # ============================================================
   convert:
     name: Convert ${{ matrix.codename }}
@@ -684,17 +676,64 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Download report (matrix.json)
+        uses: actions/download-artifact@v4
+        with:
+          name: report
+          path: /tmp/report
+
       - name: Export matrix to env
         run: |
           set -euo pipefail
-          echo "CN=${{ matrix.codename }}"             >> $GITHUB_ENV
-          echo "MODEL=${{ matrix.devicemodel }}"       >> $GITHUB_ENV
-          echo "VER=${{ matrix.version }}"             >> $GITHUB_ENV
-          echo "GAPPS_URL=${{ matrix.gapps_url }}"     >> $GITHUB_ENV
-          echo "VANILLA_URL=${{ matrix.vanilla_url }}" >> $GITHUB_ENV
-          echo "DONOR=${{ matrix.donor_codename }}"    >> $GITHUB_ENV
-          echo "DONOR_LEVEL=${{ matrix.donor_level }}" >> $GITHUB_ENV
-          echo "WORK_ROOT=/mnt/work"                   >> $GITHUB_ENV
+          CN="${{ matrix.codename }}"
+          echo "CN=$CN" >> $GITHUB_ENV
+          echo "WORK_ROOT=/mnt/work" >> $GITHUB_ENV
+
+          if [ ! -f /tmp/report/matrix.json ]; then
+            echo "ERROR: /tmp/report/matrix.json not found"
+            ls -la /tmp/report || true
+            exit 1
+          fi
+
+          ITEM=$(jq -c --arg cn "$CN" '.[] | select(.codename == $cn)' /tmp/report/matrix.json | head -1)
+          if [ -z "$ITEM" ] || [ "$ITEM" = "null" ]; then
+            echo "ERROR: matrix entry not found for $CN"
+            echo "Available codenames:"
+            jq -r '.[].codename' /tmp/report/matrix.json || true
+            exit 1
+          fi
+
+          MODEL_VAL=$(echo "$ITEM" | jq -r '.devicemodel // ""')
+          VER_VAL=$(echo "$ITEM" | jq -r '.version // ""')
+          GAPPS_VAL=$(echo "$ITEM" | jq -r '.gapps_url // ""')
+          VANILLA_VAL=$(echo "$ITEM" | jq -r '.vanilla_url // ""')
+          DONOR_VAL=$(echo "$ITEM" | jq -r '.donor_codename // ""')
+          LEVEL_VAL=$(echo "$ITEM" | jq -r '.donor_level // 0')
+
+          {
+            echo "MODEL=$MODEL_VAL"
+            echo "VER=$VER_VAL"
+            echo "GAPPS_URL=$GAPPS_VAL"
+            echo "VANILLA_URL=$VANILLA_VAL"
+            echo "DONOR=$DONOR_VAL"
+            echo "DONOR_LEVEL=$LEVEL_VAL"
+          } >> $GITHUB_ENV
+
+          echo "=== Exported for $CN ==="
+          echo "MODEL=$MODEL_VAL"
+          echo "VER=$VER_VAL"
+          echo "DONOR=$DONOR_VAL (level $LEVEL_VAL)"
+          echo "GAPPS_URL=$GAPPS_VAL"
+          echo "VANILLA_URL=$VANILLA_VAL"
+
+          if [ -z "$GAPPS_VAL" ]; then
+            echo "ERROR: empty GAPPS_URL for $CN (from matrix.json)"
+            exit 1
+          fi
+          if [ -z "$VANILLA_VAL" ]; then
+            echo "ERROR: empty VANILLA_URL for $CN (from matrix.json)"
+            exit 1
+          fi
 
       - name: Install system dependencies (cached)
         uses: awalsh128/cache-apt-pkgs-action@v1
@@ -761,22 +800,6 @@ jobs:
           mkdir -p "$WORK_ROOT/gapps" "$WORK_ROOT/vanilla" "$WORK_ROOT/work" \
                    "$WORK_ROOT/otaripper" "$WORK_ROOT/erofs-utils-src" "$WORK_ROOT/tmp"
           df -T "$WORK_ROOT"
-
-      - name: Validate donor pairing
-        run: |
-          set -euo pipefail
-          echo "GApps target:  $CN ($MODEL) v$VER"
-          echo "Vanilla donor: ${DONOR:-self} (level ${DONOR_LEVEL:-?})"
-          echo "GApps URL:   $GAPPS_URL"
-          echo "Vanilla URL: $VANILLA_URL"
-          if [ -z "$GAPPS_URL" ]; then
-            echo "ERROR: empty GAPPS_URL"
-            exit 1
-          fi
-          if [ -z "$VANILLA_URL" ]; then
-            echo "ERROR: empty VANILLA_URL (no donor, cannot convert)"
-            exit 1
-          fi
 
       - name: Download GApps firmware
         run: |
