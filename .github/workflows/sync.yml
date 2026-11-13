@@ -29,8 +29,122 @@ permissions:
 env:
   SYNC_TAG: sync
   WORK_ROOT: /mnt/work
+  EROFS_VERSION: v1.8.2
+  APT_VERSION: "1.0"
 
 jobs:
+  # ============================================================
+  # JOB 0: SETUP
+  # Runs ONCE. Builds erofs-utils, downloads otaripper,
+  # warms apt cache. Uploads binaries as artifacts so convert
+  # jobs can just download them (~10 MB) instead of rebuilding.
+  # ============================================================
+  setup:
+    name: Setup build tools
+    runs-on: ubuntu-22.04
+    outputs:
+      erofs_artifact: erofs-utils-${{ env.EROFS_VERSION }}
+      otaripper_artifact: otaripper-bin
+    steps:
+      - name: Install system dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >
+            erofs-utils e2fsprogs android-sdk-libsparse-utils brotli zip unzip
+            xz-utils attr acl p7zip-full curl wget jq file rsync
+            build-essential liblz4-dev liblzma-dev libzstd-dev uuid-dev
+            libselinux1-dev libfuse-dev pkg-config autoconf automake libtool
+            python3 python3-pip
+          version: ${{ env.APT_VERSION }}
+
+      - name: Create staging directories
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/setup/erofs-utils/bin
+          mkdir -p /tmp/setup/erofs-utils/lib
+          mkdir -p /tmp/setup/otaripper
+          df -T /tmp
+
+      - name: Build erofs-utils from source
+        run: |
+          set -euo pipefail
+          SRC=/tmp/setup/erofs-utils-src
+          git clone --depth=1 --branch "${EROFS_VERSION}" \
+            https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git "$SRC"
+          cd "$SRC"
+          ./autogen.sh
+          ./configure --prefix=/tmp/setup/erofs-utils --enable-fuse
+          make -j$(nproc)
+          make install
+          echo "=== Installed into /tmp/setup/erofs-utils ==="
+          find /tmp/setup/erofs-utils -type f | head -50
+          ls -la /tmp/setup/erofs-utils/bin/ || true
+          ls -la /tmp/setup/erofs-utils/lib/ || true
+
+      - name: Download otaripper
+        run: |
+          set -euo pipefail
+          URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux-static-x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+              | jq -r '.assets[] | select(.name | test("linux.*x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+              | head -1)
+          fi
+          echo "otaripper: $URL"
+          mkdir -p /tmp/setup/otaripper
+          curl -L -o /tmp/setup/otaripper.tar.gz "$URL"
+          tar --no-same-owner --no-same-permissions -xzf /tmp/setup/otaripper.tar.gz -C /tmp/setup/otaripper || true
+          BIN=$(find /tmp/setup/otaripper -maxdepth 2 -type f -name 'otaripper*' -executable | head -1)
+          if [ -z "$BIN" ]; then
+            BIN=$(find /tmp/setup/otaripper -maxdepth 2 -type f -name 'otaripper*' | head -1)
+          fi
+          echo "Found binary: $BIN"
+          cp "$BIN" /tmp/setup/otaripper/otaripper
+          chmod +x /tmp/setup/otaripper/otaripper
+          /tmp/setup/otaripper/otaripper --version 2>&1 | head -3 || true
+
+      - name: Verify setup binaries
+        run: |
+          set -euo pipefail
+          echo "=== EROFS bin ==="
+          ls -la /tmp/setup/erofs-utils/bin/
+          /tmp/setup/erofs-utils/bin/mkfs.erofs 2>&1 | head -1 || true
+          echo "=== EROFS lib ==="
+          ls -la /tmp/setup/erofs-utils/lib/ || true
+          echo "=== otaripper ==="
+          ls -la /tmp/setup/otaripper/
+          /tmp/setup/otaripper/otaripper --version 2>&1 | head -3 || true
+
+      - name: Package erofs-utils
+        run: |
+          set -euo pipefail
+          cd /tmp/setup
+          tar -czf erofs-utils.tar.gz -C erofs-utils .
+          ls -lh erofs-utils.tar.gz
+
+      - name: Package otaripper
+        run: |
+          set -euo pipefail
+          cd /tmp/setup
+          tar -czf otaripper.tar.gz -C otaripper .
+          ls -lh otaripper.tar.gz
+
+      - name: Upload erofs-utils artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: erofs-utils-bin
+          path: /tmp/setup/erofs-utils.tar.gz
+          retention-days: 7
+
+      - name: Upload otaripper artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: otaripper-bin
+          path: /tmp/setup/otaripper.tar.gz
+          retention-days: 7
+
   # ============================================================
   # JOB 1: DISCOVER
   # Scans official_devices repo (branches 17, 16, master).
@@ -42,6 +156,7 @@ jobs:
   # ============================================================
   discover:
     name: Discover devices
+    needs: [setup]
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.scan.outputs.matrix }}
@@ -275,7 +390,6 @@ jobs:
               target_ver = version_tuple(g.get("version"))
               target_ts = int(g.get("timestamp") or 0)
 
-              # Level 1 candidates: external donors with SAME version
               candidates_l1 = []
               if target_ver in donors_by_version:
                   for d in donors_by_version[target_ver]:
@@ -287,12 +401,10 @@ jobs:
               level = None
 
               if candidates_l1:
-                  # Level 1: external donor with same version, closest by date
                   candidates_l1.sort(key=lambda d: abs(d["timestamp"] - target_ts))
                   chosen = candidates_l1[0]
                   level = 1
               elif v:
-                  # Level 2: own vanilla (even if version differs)
                   chosen = {
                       "codename": cn,
                       "devicemodel": devicemodel,
@@ -303,7 +415,6 @@ jobs:
                   }
                   level = 2
               else:
-                  # Level 3: external donor with closest timestamp (any version)
                   all_donors = []
                   for dlist in donors_by_version.values():
                       for d in dlist:
@@ -322,7 +433,6 @@ jobs:
                   report.append(entry)
                   continue
 
-              # --- Populate donor field and reason ---
               if level == 2:
                   entry["donor"] = {
                       "codename": cn,
@@ -363,7 +473,6 @@ jobs:
               vanilla_filename = chosen["filename"]
               vanilla_timestamp = chosen["timestamp"]
 
-              # --- Incremental: compare with manifest ---
               old = existing_manifest.get(cn)
               if old and not force:
                   old_donor = old.get("donor_codename") or ""
@@ -412,7 +521,6 @@ jobs:
                   "reason": entry["reason"],
               })
 
-          # --- stale ---
           for cn in existing_manifest:
               if cn not in [r["codename"] for r in report]:
                   stale.append(cn)
@@ -514,18 +622,13 @@ jobs:
 
   # ============================================================
   # JOB 2: CONVERT
-  # For each device in matrix:
-  #   - download target GApps
-  #   - download donor Vanilla
-  #   - extract partitions from both
-  #   - apply AOSP replacement diff (gapps -> vanilla-like)
-  #   - rebuild EROFS/ext4 images preserving UUID/format
-  #   - build recovery flashable ZIP
-  # Uploads per-device artifacts. Does not touch release.
+  # Downloads pre-built erofs-utils and otaripper from setup
+  # artifacts. Installs apt packages (cached). Then runs the
+  # full GApps -> Vanilla conversion for each device.
   # ============================================================
   convert:
     name: Convert ${{ matrix.codename }}
-    needs: discover
+    needs: [setup, discover]
     if: |
       !inputs.dry_run
       && needs.discover.outputs.has_jobs == 'true'
@@ -537,73 +640,91 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
-    env:
-      WORK_ROOT: /mnt/work
-      CN: ${{ matrix.codename }}
-      MODEL: ${{ matrix.devicemodel }}
-      VER: ${{ matrix.version }}
-      GAPPS_URL: ${{ matrix.gapps_url }}
-      VANILLA_URL: ${{ matrix.vanilla_url }}
-      DONOR: ${{ matrix.donor_codename }}
-      DONOR_LEVEL: ${{ matrix.donor_level }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Export matrix to env
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            erofs-utils e2fsprogs android-sdk-libsparse-utils brotli zip unzip \
-            xz-utils attr acl p7zip-full curl wget jq file rsync \
-            build-essential liblz4-dev liblzma-dev libzstd-dev uuid-dev \
-            libselinux1-dev libfuse-dev pkg-config autoconf automake libtool \
+          set -euo pipefail
+          echo "CN=${{ matrix.codename }}"             >> $GITHUB_ENV
+          echo "MODEL=${{ matrix.devicemodel }}"       >> $GITHUB_ENV
+          echo "VER=${{ matrix.version }}"             >> $GITHUB_ENV
+          echo "GAPPS_URL=${{ matrix.gapps_url }}"     >> $GITHUB_ENV
+          echo "VANILLA_URL=${{ matrix.vanilla_url }}" >> $GITHUB_ENV
+          echo "DONOR=${{ matrix.donor_codename }}"    >> $GITHUB_ENV
+          echo "DONOR_LEVEL=${{ matrix.donor_level }}" >> $GITHUB_ENV
+          echo "WORK_ROOT=/mnt/work"                   >> $GITHUB_ENV
+
+      - name: Install system dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >
+            erofs-utils e2fsprogs android-sdk-libsparse-utils brotli zip unzip
+            xz-utils attr acl p7zip-full curl wget jq file rsync
+            build-essential liblz4-dev liblzma-dev libzstd-dev uuid-dev
+            libselinux1-dev libfuse-dev pkg-config autoconf automake libtool
             python3 python3-pip
+          version: ${{ env.APT_VERSION }}
+
+      - name: Download erofs-utils artifact from setup
+        uses: actions/download-artifact@v4
+        with:
+          name: erofs-utils-bin
+          path: /tmp/erofs-utils
+
+      - name: Install erofs-utils from artifact
+        run: |
+          set -euo pipefail
+          tar -xzf /tmp/erofs-utils/erofs-utils.tar.gz -C /tmp/erofs-utils/
+          ls -la /tmp/erofs-utils/bin/ || true
+          sudo cp /tmp/erofs-utils/bin/* /usr/local/bin/ 2>/dev/null || true
+          sudo chmod +x /usr/local/bin/mkfs.erofs /usr/local/bin/fsck.erofs \
+                        /usr/local/bin/dump.erofs /usr/local/bin/extract.erofs 2>/dev/null || true
+          if [ -d /tmp/erofs-utils/lib ]; then
+            sudo cp -a /tmp/erofs-utils/lib/. /usr/local/lib/ 2>/dev/null || true
+          fi
+          sudo ldconfig || true
+          echo "=== Verify erofs-utils ==="
+          which mkfs.erofs fsck.erofs dump.erofs extract.erofs || true
+          mkfs.erofs 2>&1 | head -1 || true
+          fsck.erofs 2>&1 | head -1 || true
+          dump.erofs 2>&1 | head -1 || true
+
+      - name: Download otaripper artifact from setup
+        uses: actions/download-artifact@v4
+        with:
+          name: otaripper-bin
+          path: /tmp/otaripper
+
+      - name: Install otaripper from artifact
+        run: |
+          set -euo pipefail
+          tar -xzf /tmp/otaripper/otaripper.tar.gz -C /tmp/otaripper/
+          ls -la /tmp/otaripper/ || true
+          BIN=/tmp/otaripper/otaripper
+          if [ ! -f "$BIN" ]; then
+            BIN=$(find /tmp/otaripper -maxdepth 2 -type f -name 'otaripper*' -executable | head -1)
+          fi
+          echo "Using otaripper: $BIN"
+          sudo cp "$BIN" /usr/local/bin/otaripper
+          sudo chmod +x /usr/local/bin/otaripper
+          echo "=== Verify otaripper ==="
+          which otaripper || true
+          otaripper --version 2>&1 | head -3 || true
 
       - name: Create working directories
         run: |
+          set -euo pipefail
           sudo mkdir -p "$WORK_ROOT"
           sudo chown $USER:$USER "$WORK_ROOT"
           mkdir -p "$WORK_ROOT/gapps" "$WORK_ROOT/vanilla" "$WORK_ROOT/work" \
                    "$WORK_ROOT/otaripper" "$WORK_ROOT/erofs-utils-src" "$WORK_ROOT/tmp"
           df -T "$WORK_ROOT"
 
-      - name: Build erofs-utils from source
-        run: |
-          set -e
-          SRC="$WORK_ROOT/erofs-utils-src"
-          git clone --depth=1 --branch v1.8.2 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git "$SRC"
-          cd "$SRC"
-          ./autogen.sh
-          ./configure --prefix=/usr/local --enable-fuse
-          make -j$(nproc)
-          sudo make install
-          sudo ldconfig
-          which mkfs.erofs fsck.erofs dump.erofs extract.erofs || true
-
-      - name: Install otaripper
-        run: |
-          set -e
-          URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
-            | jq -r '.assets[] | select(.name | test("linux-static-x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
-            | head -1)
-          [ -z "$URL" ] && URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
-            | jq -r '.assets[] | select(.name | test("linux.*x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
-            | head -1)
-          echo "otaripper: $URL"
-          mkdir -p "$WORK_ROOT/otaripper"
-          curl -L -o "$WORK_ROOT/otaripper.tar.gz" "$URL"
-          tar --no-same-owner --no-same-permissions -xzf "$WORK_ROOT/otaripper.tar.gz" -C "$WORK_ROOT/otaripper" || true
-          BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' -executable | head -1)
-          [ -z "$BIN" ] && BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' | head -1)
-          sudo cp "$BIN" /usr/local/bin/otaripper
-          sudo chmod +x /usr/local/bin/otaripper
-          otaripper --version 2>&1 | head -3 || true
-
       - name: Validate donor pairing
         run: |
+          set -euo pipefail
           echo "GApps target:  $CN ($MODEL) v$VER"
           echo "Vanilla donor: ${DONOR:-self} (level ${DONOR_LEVEL:-?})"
           echo "GApps URL:   $GAPPS_URL"
@@ -1533,7 +1654,7 @@ jobs:
   # ============================================================
   publish:
     name: Publish sync release
-    needs: [discover, convert]
+    needs: [setup, discover, convert]
     if: |
       !inputs.dry_run
       && always()
