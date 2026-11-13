@@ -317,6 +317,18 @@ jobs:
               m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", fn)
               return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else ""
 
+          def valid_url(value):
+              if not value:
+                  return False
+              value = str(value).strip()
+              if not value:
+                  return False
+              if value.lower() in ("null", "none", "-", "unknown"):
+                  return False
+              if not (value.startswith("http://") or value.startswith("https://")):
+                  return False
+              return True
+
           devices = list_devices()
           print(f"Discovered {len(devices)} devices", file=sys.stderr)
           if not devices:
@@ -343,6 +355,8 @@ jobs:
           for cn, info in all_info.items():
               v = info["vanilla"]
               if not v:
+                  continue
+              if not valid_url(v.get("download")):
                   continue
               vt = version_tuple(v.get("version"))
               if not vt:
@@ -412,6 +426,16 @@ jobs:
                   report.append(entry)
                   continue
 
+              if not valid_url(g.get("download")):
+                  entry["reason"] = "gapps entry present but download URL is missing or invalid"
+                  report.append(entry)
+                  continue
+
+              if not norm_version(g.get("version")):
+                  entry["reason"] = "gapps entry present but version field is empty"
+                  report.append(entry)
+                  continue
+
               if v and norm_version(g.get("version")) == norm_version(v.get("version")):
                   entry["reason"] = f"vanilla exists with same version {norm_version(v.get('version'))}"
                   report.append(entry)
@@ -434,7 +458,7 @@ jobs:
                   candidates_l1.sort(key=lambda d: abs(d["timestamp"] - target_ts))
                   chosen = candidates_l1[0]
                   level = 1
-              elif v:
+              elif v and valid_url(v.get("download")):
                   chosen = {
                       "codename": cn,
                       "devicemodel": devicemodel,
@@ -457,7 +481,12 @@ jobs:
                       level = 3
 
               if not chosen:
-                  entry["reason"] = "no vanilla and no donor available"
+                  entry["reason"] = "no vanilla and no donor available with valid download URL"
+                  report.append(entry)
+                  continue
+
+              if not valid_url(chosen.get("download")):
+                  entry["reason"] = f"selected donor {chosen.get('codename') or 'unknown'} has no valid download URL"
                   report.append(entry)
                   continue
 
@@ -500,6 +529,13 @@ jobs:
               vanilla_url = chosen["download"]
               vanilla_filename = chosen["filename"]
               vanilla_timestamp = chosen["timestamp"]
+
+              if not valid_url(vanilla_url):
+                  entry["publish"] = False
+                  entry["action"] = "skip"
+                  entry["reason"] = "resolved vanilla download URL is missing or invalid"
+                  report.append(entry)
+                  continue
 
               old = existing_manifest.get(cn)
               if old and not force:
@@ -670,6 +706,8 @@ jobs:
         include: ${{ fromJson(needs.discover.outputs.matrix) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    env:
+      WORK_ROOT: /mnt/work
 
     steps:
       - name: Checkout repository
@@ -725,16 +763,22 @@ jobs:
           echo "GAPPS_URL=$GAPPS_VAL"
           echo "VANILLA_URL=$VANILLA_VAL"
 
-          if [ -z "$GAPPS_VAL" ]; then
-            echo "ERROR: empty GAPPS_URL for $CN (from matrix.json)"
-            exit 1
+          if [ -z "$GAPPS_VAL" ] || [ -z "$VANILLA_VAL" ]; then
+            echo "WARN: $CN has empty GAPPS_URL or VANILLA_URL in matrix.json"
+            echo "Marking device as skipped instead of failing the job"
+            echo "SKIP_DEVICE=true" >> $GITHUB_ENV
+            exit 0
           fi
-          if [ -z "$VANILLA_VAL" ]; then
-            echo "ERROR: empty VANILLA_URL for $CN (from matrix.json)"
-            exit 1
-          fi
+          echo "SKIP_DEVICE=false" >> $GITHUB_ENV
+
+      - name: Skip remaining steps if device has no URLs
+        if: env.SKIP_DEVICE == 'true'
+        run: |
+          echo "Skipping conversion for ${{ matrix.codename }} because GAPPS_URL or VANILLA_URL is empty"
+          echo "### Skipped ${{ matrix.codename }} (missing URL)" >> $GITHUB_STEP_SUMMARY
 
       - name: Install system dependencies (cached)
+        if: env.SKIP_DEVICE != 'true'
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: >
@@ -746,12 +790,14 @@ jobs:
           version: ${{ env.APT_VERSION }}
 
       - name: Download erofs-utils artifact from setup
+        if: env.SKIP_DEVICE != 'true'
         uses: actions/download-artifact@v4
         with:
           name: erofs-utils-bin
           path: /tmp/erofs-utils
 
       - name: Install erofs-utils from artifact
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           tar -xzf /tmp/erofs-utils/erofs-utils.tar.gz -C /tmp/erofs-utils/
@@ -770,12 +816,14 @@ jobs:
           dump.erofs 2>&1 | head -1 || true
 
       - name: Download otaripper artifact from setup
+        if: env.SKIP_DEVICE != 'true'
         uses: actions/download-artifact@v4
         with:
           name: otaripper-bin
           path: /tmp/otaripper
 
       - name: Install otaripper from artifact
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           tar -xzf /tmp/otaripper/otaripper.tar.gz -C /tmp/otaripper/
@@ -792,6 +840,7 @@ jobs:
           otaripper --version 2>&1 | head -3 || true
 
       - name: Create working directories
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           sudo mkdir -p "$WORK_ROOT"
@@ -801,6 +850,7 @@ jobs:
           df -T "$WORK_ROOT"
 
       - name: Download GApps firmware
+        if: env.SKIP_DEVICE != 'true'
         run: |
           echo "GApps: $GAPPS_URL"
           curl -L --retry 5 --retry-delay 5 --retry-connrefused \
@@ -808,6 +858,7 @@ jobs:
           ls -lh "$WORK_ROOT/gapps/image"
 
       - name: Download Vanilla firmware
+        if: env.SKIP_DEVICE != 'true'
         run: |
           echo "Vanilla: $VANILLA_URL"
           curl -L --retry 5 --retry-delay 5 --retry-connrefused \
@@ -815,6 +866,7 @@ jobs:
           ls -lh "$WORK_ROOT/vanilla/image"
 
       - name: Extract GApps archive and payload.bin
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           cd "$WORK_ROOT/gapps"
@@ -877,6 +929,7 @@ jobs:
           ls -lh extracted/
 
       - name: Extract Vanilla archive and payload.bin
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           cd "$WORK_ROOT/vanilla"
@@ -939,6 +992,7 @@ jobs:
           ls -lh extracted/
 
       - name: Auto-detect image formats and extract partitions
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           cd "$WORK_ROOT/work"
@@ -1044,6 +1098,7 @@ jobs:
           fi
 
       - name: Log source image sizes (before)
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -e
           cd "$WORK_ROOT/work"
@@ -1080,6 +1135,7 @@ jobs:
           done
 
       - name: Compute and apply GApps to Vanilla diff (AOSP replacement)
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           cd "$WORK_ROOT/work"
@@ -1330,7 +1386,7 @@ jobs:
           echo "=== Diff applied ==="
 
       - name: Print diff report (stdout)
-        if: always()
+        if: always() && env.SKIP_DEVICE != 'true'
         run: |
           set -euo pipefail
           cd "$WORK_ROOT/work"
@@ -1359,6 +1415,7 @@ jobs:
           echo "############ END DIFF SUMMARY ############"
 
       - name: Detect original UUIDs and filesystem parameters
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -e
           cd "$WORK_ROOT/work"
@@ -1406,6 +1463,7 @@ jobs:
           done
 
       - name: Detect EROFS parameters from original images
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -e
           cd "$WORK_ROOT/work"
@@ -1499,6 +1557,7 @@ jobs:
           done
 
       - name: Rebuild images preserving format, UUID and SELinux
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -e
           cd "$WORK_ROOT/work"
@@ -1563,6 +1622,7 @@ jobs:
           done
 
       - name: Log rebuilt image sizes (after)
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -e
           cd "$WORK_ROOT/work"
@@ -1596,6 +1656,7 @@ jobs:
           done
 
       - name: Create recovery flashable ZIP
+        if: env.SKIP_DEVICE != 'true'
         run: |
           set -e
           cd "$WORK_ROOT/work"
@@ -1677,6 +1738,7 @@ jobs:
           ls -lh
 
       - name: Upload device artifacts
+        if: env.SKIP_DEVICE != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: vanilla-images-${{ matrix.codename }}
@@ -1690,7 +1752,7 @@ jobs:
           retention-days: 7
 
       - name: Upload diff logs
-        if: always()
+        if: always() && env.SKIP_DEVICE != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: diff-logs-${{ matrix.codename }}
@@ -1771,6 +1833,9 @@ jobs:
               pattern = f"all/vanilla-images-{cn}/{cn}-*"
               files = sorted(glob.glob(pattern))
               assets = [os.path.basename(f) for f in files if os.path.isfile(f)]
+              if not assets:
+                  print(f"Skipping manifest entry for {cn}: no uploaded artifacts found")
+                  continue
               touched[cn] = {
                   "codename": cn,
                   "devicemodel": item["devicemodel"],
