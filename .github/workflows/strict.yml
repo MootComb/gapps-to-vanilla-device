@@ -1,0 +1,863 @@
+name: Strict
+
+on:
+  workflow_dispatch:
+    inputs:
+      gapps_url:
+        description: 'URL of the GApps firmware (zip OTA, zip images, img.xz, or raw img)'
+        required: false
+        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-X6833B-18.10.2026-GAPPS-OFFICIAL.zip'
+      vanilla_url:
+        description: 'URL of the Vanilla firmware (zip OTA, zip images, img.xz, or raw img)'
+        required: false
+        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-dubai-18.10.2026-VANILLA-OFFICIAL.zip'
+      release_tag:
+        description: 'Release tag (use "auto" for automatic timestamp-based tag)'
+        required: false
+        default: 'auto'
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    name: Convert GApps to Vanilla
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      WORK_ROOT: /mnt/work
+      # Search order: all partitions first, then specific dirs inside each partition
+      PARTITIONS: "system system_ext product"
+      COMPONENT_DIRS: "priv-app app overlay lib lib64 etc/permissions etc/sysconfig apex"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            erofs-utils e2fsprogs android-sdk-libsparse-utils zip unzip \
+            xz-utils brotli attr acl p7zip-full curl wget jq file rsync \
+            build-essential liblz4-dev liblzma-dev libzstd-dev uuid-dev \
+            libselinux1-dev libfuse-dev pkg-config autoconf automake libtool \
+            python3 python3-pip
+
+      - name: Create working directories on ext4 (/mnt/work)
+        run: |
+          sudo mkdir -p "$WORK_ROOT"
+          sudo chown $USER:$USER "$WORK_ROOT"
+          mkdir -p "$WORK_ROOT/gapps" "$WORK_ROOT/vanilla" "$WORK_ROOT/work" \
+                   "$WORK_ROOT/otaripper" "$WORK_ROOT/erofs-utils-src" "$WORK_ROOT/tmp"
+          df -T "$WORK_ROOT"
+
+      - name: Build erofs-utils from source (>= 1.8 for fsck.erofs --xattrs)
+        run: |
+          set -e
+          SRC="$WORK_ROOT/erofs-utils-src"
+          git clone --depth=1 --branch v1.8.2 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git "$SRC"
+          cd "$SRC"
+          ./autogen.sh
+          ./configure --prefix=/usr/local --enable-fuse
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          which mkfs.erofs fsck.erofs dump.erofs erofsfuse || true
+
+      - name: Install otaripper
+        run: |
+          set -e
+          URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux-static-x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          [ -z "$URL" ] && URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux.*x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          mkdir -p "$WORK_ROOT/otaripper"
+          curl -L -o "$WORK_ROOT/otaripper.tar.gz" "$URL"
+          tar --no-same-owner --no-same-permissions -xzf "$WORK_ROOT/otaripper.tar.gz" -C "$WORK_ROOT/otaripper" || true
+          BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' -executable | head -1)
+          [ -z "$BIN" ] && BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' | head -1)
+          sudo cp "$BIN" /usr/local/bin/otaripper
+          sudo chmod +x /usr/local/bin/otaripper
+          otaripper --version 2>&1 | head -3 || true
+
+      - name: Download GApps firmware
+        run: |
+          echo "Downloading GApps firmware from: ${{ github.event.inputs.gapps_url }}"
+          curl -L --retry 5 --retry-delay 5 --retry-connrefused \
+            -o "$WORK_ROOT/gapps/image" "${{ github.event.inputs.gapps_url }}"
+          ls -lh "$WORK_ROOT/gapps/image"
+
+      - name: Download Vanilla firmware
+        run: |
+          echo "Downloading Vanilla firmware from: ${{ github.event.inputs.vanilla_url }}"
+          curl -L --retry 5 --retry-delay 5 --retry-connrefused \
+            -o "$WORK_ROOT/vanilla/image" "${{ github.event.inputs.vanilla_url }}"
+          ls -lh "$WORK_ROOT/vanilla/image"
+
+      - name: Extract GApps archive and payload.bin
+        run: |
+          set -e
+          cd "$WORK_ROOT/gapps"
+          mkdir -p extracted
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "GApps: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "GApps: xz OK"
+            [ -f image ] && mv image extracted/system.img
+          else
+            echo "GApps: raw image"
+            mv image extracted/system.img
+          fi
+
+          if [ -f extracted/payload.bin ]; then
+            echo "GApps: payload.bin detected, extracting with otaripper..."
+            mkdir -p extracted/images
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || \
+              otaripper extracted/payload.bin -o extracted/images || true
+            find extracted/images -maxdepth 2 -name "system.img"     -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img"    -exec mv {} extracted/ \;
+          fi
+
+          if find extracted -maxdepth 1 -name '*.new.dat.br' -print -quit | grep -q .; then
+            echo "GApps: block-OTA detected, decoding..."
+            for part in system system_ext product vendor; do
+              br="extracted/${part}.new.dat.br"; dat="extracted/${part}.new.dat"
+              tl="extracted/${part}.transfer.list"; img="extracted/${part}.img"
+              if [ -f "$br" ] && [ -f "$tl" ]; then
+                brotli -d -f -o "$dat" "$br"
+                python3 "$WORK_ROOT/tmp/sdat2img.py" "$tl" "$dat" "$img" 2>/dev/null || true
+                rm -f "$dat"
+              fi
+            done
+          fi
+
+          ls -lh extracted/
+
+      - name: Extract Vanilla archive and payload.bin
+        run: |
+          set -e
+          cd "$WORK_ROOT/vanilla"
+          mkdir -p extracted
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "Vanilla: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "Vanilla: xz OK"
+            [ -f image ] && mv image extracted/system.img
+          else
+            echo "Vanilla: raw image"
+            mv image extracted/system.img
+          fi
+
+          if [ -f extracted/payload.bin ]; then
+            echo "Vanilla: payload.bin detected, extracting with otaripper..."
+            mkdir -p extracted/images
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || \
+              otaripper extracted/payload.bin -o extracted/images || true
+            find extracted/images -maxdepth 2 -name "system.img"     -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img"    -exec mv {} extracted/ \;
+          fi
+
+          if find extracted -maxdepth 1 -name '*.new.dat.br' -print -quit | grep -q .; then
+            echo "Vanilla: block-OTA detected, decoding..."
+            curl -fsSL -o "$WORK_ROOT/tmp/sdat2img.py" \
+              https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py || true
+            chmod +x "$WORK_ROOT/tmp/sdat2img.py" || true
+            for part in system system_ext product vendor; do
+              br="extracted/${part}.new.dat.br"; dat="extracted/${part}.new.dat"
+              tl="extracted/${part}.transfer.list"; img="extracted/${part}.img"
+              if [ -f "$br" ] && [ -f "$tl" ]; then
+                brotli -d -f -o "$dat" "$br"
+                python3 "$WORK_ROOT/tmp/sdat2img.py" "$tl" "$dat" "$img" 2>/dev/null || true
+                rm -f "$dat"
+              fi
+            done
+          fi
+
+          ls -lh extracted/
+
+      - name: Extract partition images to raw trees (with ownership fix)
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+
+          extract_image() {
+            local img="$1" out="$2"
+            mkdir -p "$out"
+            echo "  Image: $img"
+
+            if fsck.erofs --extract="$out" --xattrs --preserve "$img" >/dev/null 2>&1; then
+              echo "  OK: fsck.erofs --extract"
+            elif sudo mount -o loop,ro "$img" "$out" >/dev/null 2>&1; then
+              echo "  OK: mount loop"
+            elif simg2img "$img" "${img}.raw" >/dev/null 2>&1 && \
+                 sudo mount -o loop,ro "${img}.raw" "$out" >/dev/null 2>&1; then
+              echo "  OK: simg2img + mount loop"
+            else
+              echo "  ERROR: unable to extract $img"
+              return 1
+            fi
+
+            # Critical: remove immutable bit and reset ownership BEFORE any cp
+            sudo chown -R "$USER:$USER" "$out" || true
+            sudo find "$out" -exec chattr -i {} + 2>/dev/null || true
+            mountpoint -q "$out" && sudo umount "$out" || true
+            return 0
+          }
+
+          for side in gapps vanilla; do
+            for part in $PARTITIONS; do
+              img=$(find "$WORK_ROOT/$side/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+              if [ -n "$img" ]; then
+                echo "${side} ${part}: $img"
+                extract_image "$img" "${side}_${part}_raw" || exit 1
+              else
+                echo "WARNING: ${side} ${part}.img not found"
+              fi
+            done
+          done
+
+          echo "=== Extracted ==="
+          ls -la
+
+      # ------------------------------------------------------------------
+      # Helpers: search any component across all partitions and dirs
+      # ------------------------------------------------------------------
+      - name: Define search and copy helpers
+        run: |
+          set -euo pipefail
+          cat > "$WORK_ROOT/work/helpers.sh" <<'HELPERS_EOF'
+          #!/usr/bin/env bash
+          # find_component <side> <name> [<kind>]
+          #   side   : gapps | vanilla
+          #   name   : e.g. ContactsPicker, Velvet, libjni_latinime.so, com.android.contacts.xml
+          #   kind   : dir | file | any (default: any)
+          # Searches ALL partitions (system/system_ext/product) and ALL dirs
+          # (priv-app/app/overlay/lib/lib64/etc/permissions/etc/sysconfig/apex).
+          # Prints every match, one per line.
+          find_component() {
+            local side="$1" name="$2" kind="${3:-any}"
+            local partitions="${PARTITIONS:-system system_ext product}"
+            local dirs="${COMPONENT_DIRS:-priv-app app overlay lib lib64 etc/permissions etc/sysconfig apex}"
+            local p d root
+            for p in $partitions; do
+              root="$WORK_ROOT/work/${side}_${p}_raw"
+              [ -d "$root" ] || continue
+              for d in $dirs; do
+                [ -d "$root/$d" ] || continue
+                # exact name match
+                if [ -e "$root/$d/$name" ] || [ -L "$root/$d/$name" ]; then
+                  if [ "$kind" = "any" ] || \
+                     { [ "$kind" = "dir" ]  && [ -d "$root/$d/$name" ]; } || \
+                     { [ "$kind" = "file" ] && [ -f "$root/$d/$name" ]; }; then
+                    echo "$root/$d/$name"
+                  fi
+                fi
+              done
+            done
+          }
+
+          # find_component_glob <side> <glob-pattern> [<kind>]
+          find_component_glob() {
+            local side="$1" pat="$2" kind="${3:-any}"
+            local partitions="${PARTITIONS:-system system_ext product}"
+            local dirs="${COMPONENT_DIRS:-priv-app app overlay lib lib64 etc/permissions etc/sysconfig apex}"
+            local p d root
+            for p in $partitions; do
+              root="$WORK_ROOT/work/${side}_${p}_raw"
+              [ -d "$root" ] || continue
+              for d in $dirs; do
+                [ -d "$root/$d" ] || continue
+                # shellcheck disable=SC2086
+                for f in $root/$d/$pat; do
+                  [ -e "$f" ] || [ -L "$f" ] || continue
+                  if [ "$kind" = "any" ] || \
+                     { [ "$kind" = "dir" ]  && [ -d "$f" ]; } || \
+                     { [ "$kind" = "file" ] && [ -f "$f" ]; }; then
+                    echo "$f"
+                  fi
+                done
+              done
+            done
+          }
+
+          # copy_item <src> <dst> — preserves attrs, handles symlinks & immutable
+          copy_item() {
+            local src="$1" dst="$2"
+            [ -e "$src" ] || [ -L "$src" ] || { echo "  SKIP (absent): $src"; return 0; }
+            mkdir -p "$(dirname "$dst")"
+            if [ -e "$dst" ] || [ -L "$dst" ]; then
+              sudo chattr -i "$dst" 2>/dev/null || true
+              sudo rm -f "$dst" 2>/dev/null || rm -f "$dst" 2>/dev/null || true
+            fi
+            if ! cp -a --preserve=all "$src" "$dst" 2>/dev/null; then
+              sudo cp -a --preserve=all "$src" "$dst" || { echo "  ERROR: cannot copy $src"; return 1; }
+            fi
+            sudo chown -h "$USER:$USER" "$dst" 2>/dev/null || true
+            echo "  COPIED: $src -> $dst"
+          }
+
+          # copy_component <src_path> — copies a component to the SAME partition
+          # dir it was found in on vanilla. If gapps already has that exact path,
+          # it is replaced; if not, the component is created at the vanilla path.
+          copy_component() {
+            local src="$1"
+            [ -e "$src" ] || [ -L "$src" ] || { echo "  SKIP (absent): $src"; return 0; }
+            # Extract partition from path: .../vanilla_<part>_raw/<rest>
+            local rel="${src#$WORK_ROOT/work/vanilla_}"
+            local part="${rel%%_raw/*}"
+            local rest="${rel#${part}_raw/}"
+            local dst="$WORK_ROOT/work/gapps_${part}_raw/$rest"
+            copy_item "$src" "$dst"
+          }
+
+          label_file() {
+            local f="$1"; [ -f "$f" ] || return 0
+            setfattr -n security.selinux -v "u:object_r:system_file:s0" "$f" 2>/dev/null || true
+          }
+
+          label_dir() {
+            local d="$1"; [ -d "$d" ] || return 0
+            find "$d" -type f -exec setfattr -n security.selinux -v "u:object_r:system_file:s0" {} + 2>/dev/null || true
+            find "$d" -type d -exec setfattr -n security.selinux -v "u:object_r:system_file:s0" {} + 2>/dev/null || true
+          }
+
+          # remove_component <side> <name> [<kind>] — removes matching component
+          # from ALL partitions/dirs on the given side.
+          remove_component() {
+            local side="$1" name="$2" kind="${3:-any}"
+            local matches
+            matches=$(find_component "$side" "$name" "$kind" || true)
+            if [ -z "$matches" ]; then
+              echo "  (not present): $name"
+              return 0
+            fi
+            while IFS= read -r m; do
+              [ -z "$m" ] && continue
+              echo "  REMOVING: $m"
+              sudo chattr -i "$m" 2>/dev/null || true
+              rm -rf "$m" 2>/dev/null || sudo rm -rf "$m" 2>/dev/null || true
+            done <<< "$matches"
+          }
+
+          # remove_component_glob <side> <glob-pattern>
+          remove_component_glob() {
+            local side="$1" pat="$2"
+            local matches
+            matches=$(find_component_glob "$side" "$pat" || true)
+            while IFS= read -r m; do
+              [ -z "$m" ] && continue
+              echo "  REMOVING: $m"
+              sudo chattr -i "$m" 2>/dev/null || true
+              rm -rf "$m" 2>/dev/null || sudo rm -rf "$m" 2>/dev/null || true
+            done <<< "$matches"
+          }
+
+          # copy_component_all <name> [<kind>] — copy every match of <name>
+          # from vanilla into the same partition on gapps.
+          copy_component_all() {
+            local name="$1" kind="${2:-any}"
+            local matches
+            matches=$(find_component vanilla "$name" "$kind" || true)
+            if [ -z "$matches" ]; then
+              echo "  (vanilla has no): $name"
+              return 0
+            fi
+            while IFS= read -r m; do
+              [ -z "$m" ] && continue
+              copy_component "$m"
+            done <<< "$matches"
+          }
+
+          # copy_component_glob_all <pattern>
+          copy_component_glob_all() {
+            local pat="$1"
+            local matches
+            matches=$(find_component_glob vanilla "$pat" || true)
+            while IFS= read -r m; do
+              [ -z "$m" ] && continue
+              copy_component "$m"
+            done <<< "$matches"
+          }
+          HELPERS_EOF
+          chmod +x "$WORK_ROOT/work/helpers.sh"
+          echo "helpers.sh written"
+
+      # ------------------------------------------------------------------
+      # HARDCODED removal of GApps (all partitions, both app/priv-app)
+      # ------------------------------------------------------------------
+      - name: HARDCODED removal of GApps components
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+          source ./helpers.sh
+
+          echo "=== Removing GApps components (all partitions) ==="
+
+          # Apps/priv-apps by directory name
+          for name in \
+            AndroidAutoStubPrebuilt ConfigUpdater \
+            DeviceIntelligenceNetworkPrebuiltAstrea \
+            DevicePersonalizationAiAiPrebuiltPixel2025 \
+            GoogleRestorePrebuilt-v1007163 PartnerSetupPrebuilt Phonesky \
+            PrebuiltDeskClockGoogle_76042511 PrebuiltGmsCore SearchSelectorPrebuilt \
+            SettingsIntelligence SettingsIntelligenceGooglePrebuilt \
+            SetupWizardPrebuilt_versioned TurboPrebuilt Velvet WallpaperEffect WellbeingPrebuilt \
+            CalculatorGooglePrebuilt_85006267 Chrome Chrome-Stub \
+            DevicePolicyPrebuilt-v10572820 GoogleContacts GoogleTTS \
+            LatinIMEGooglePrebuilt LocationHistoryPrebuilt MarkupGoogle_v2 \
+            ModuleMetadataGoogle PixelThemesStub2025 SoundPickerPrebuilt_33000242 \
+            SwitchAccessPrebuilt_1.17.0.877181440 talkback TrichromeLibrary \
+            TrichromeLibrary-Stub WallpaperAIPrebuilt_10000372 \
+            WallpaperEmojiPrebuilt-foldable-wallpaper WebViewGoogle WebViewGoogle-Stub \
+            GoogleServicesFramework WallpaperPickerGoogleRelease \
+            SetupWizardPixelPrebuilt_versioned MagicPortraitWallpapers \
+            TagGoogle GoogleExtShared GooglePrintRecommendationService \
+            Flipendo ; do
+            remove_component gapps "$name" dir
+          done
+
+          # Various files/configs
+          remove_component_glob gapps '*_GMS.apk'
+          remove_component     gapps 'GoogleSettingsOverlay.apk'
+          remove_component     gapps 'FrameworkOverlayThemePicker.apk'
+          remove_component     gapps 'SettingsOverlayThemePicker.apk'
+          remove_component     gapps 'SystemUIOverlayThemePicker.apk'
+          remove_component     gapps 'FrameworkPixelSounds.apk'
+          remove_component     gapps 'SettingsPixelSounds.apk'
+          remove_component     gapps 'PixelWallpaperOverlay' dir
+          remove_component_glob gapps '*GlanceableHub*'
+
+          remove_component gapps 'default-permissions-com.google.android.apps.pixel.agent.xml' file
+          remove_component gapps 'default-permissions-safetyhub.xml' file
+          remove_component gapps 'com.google.android.apps.setupwizard.searchselector.xml' file
+          remove_component gapps 'privapp-permissions-google-p.xml' file
+          remove_component gapps 'velvet_app-privapp-permissions.xml' file
+          remove_component gapps 'privapp-permissions-google-se.xml' file
+          remove_component gapps 'privapp-permissions-google.xml' file
+          remove_component gapps 'google-privapp-permissions-themepicker-se.xml' file
+          remove_component gapps 'com.google.android.mainline.patchlevel.2.xml' file
+
+          for f in \
+            allowed_apex_com.google.android.gmssystem.xml \
+            contextual_search.xml game_service.xml google_build.xml \
+            google-hiddenapi-package-whitelist.xml \
+            google-preinstalled-packages-product-themepicker.xml \
+            google-staged-installer-whitelist.xml google.xml nexus.xml nga.xml \
+            sysconfig-themepicker.xml ; do
+            remove_component gapps "$f" file
+          done
+          remove_component_glob gapps 'pixel_experience_*.xml'
+          remove_component_glob gapps 'preinstalled-packages-product-pixel-*.xml'
+          remove_component gapps 'google.xml' file   # preferred-apps
+          remove_component gapps 'gms_fsverity_cert.der' file
+          remove_component gapps 'play_store_fsi_cert.der' file
+          remove_component gapps 'com.google.android.gmssystem.prodvic.apex' file
+          remove_component gapps 'com.google.android.extservices.apex' file
+
+          # usr/srec and usr/share/ime/google (GApps speech/ime data)
+          for p in $PARTITIONS; do
+            root="gapps_${p}_raw"
+            [ -d "$root/usr/srec/en-US" ] && rm -rf "$root/usr/srec/en-US"
+            [ -d "$root/usr/share/ime/google" ] && rm -rf "$root/usr/share/ime/google"
+          done
+
+          echo "=== GApps components removed ==="
+
+      # ------------------------------------------------------------------
+      # HARDCODED addition of AOSP components (any partition, app or priv-app)
+      # ------------------------------------------------------------------
+      - name: HARDCODED add AOSP components from Vanilla
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+          source ./helpers.sh
+
+          echo "=== Adding AOSP components from Vanilla (all partitions) ==="
+
+          # Directories (app or priv-app — both searched automatically)
+          for name in \
+            ExtShared LiveWallpapersPicker ContactsPicker WallpaperBackup \
+            Provision ThemePicker ModuleMetadata DeskClock ExactCalculator \
+            LatinIME webview Jelly Contacts ; do
+            copy_component_all "$name" dir
+          done
+
+          # Individual files
+          copy_component_all 'android.software.live_wallpaper.xml' file
+          copy_component_all 'com.android.provision.xml' file
+          copy_component_all 'com.android.contacts.xml' file
+          copy_component_all 'libjni_latinime.so' file
+          copy_component_all 'preinstalled-packages-org.lineageos.jelly.xml' file
+          copy_component_all 'initial-package-stopped-states-org.lineageos.jelly.xml' file
+
+          # LatinIME overlay APKs (glob)
+          copy_component_glob_all 'LatinIME__*_auto_generated_rro_product.apk'
+
+          # ext.services apex: materialize from .capex if GApps lacks it
+          if ! find_component gapps 'com.android.extservices.apex' file >/dev/null 2>&1; then
+            capex=$(find_component vanilla 'com.android.extservices.capex' file | head -1)
+            if [ -n "$capex" ]; then
+              rm -rf "$WORK_ROOT/tmp/capex_extract"; mkdir -p "$WORK_ROOT/tmp/capex_extract"
+              unzip -o "$capex" -d "$WORK_ROOT/tmp/capex_extract" >/dev/null 2>&1 || true
+              if [ -f "$WORK_ROOT/tmp/capex_extract/original_apex" ]; then
+                rel="${capex#$WORK_ROOT/work/vanilla_}"
+                part="${rel%%_raw/*}"
+                rest="${rel#${part}_raw/}"
+                rest="${rest%.capex}.apex"
+                copy_item "$WORK_ROOT/tmp/capex_extract/original_apex" \
+                          "$WORK_ROOT/work/gapps_${part}_raw/$rest"
+              fi
+            fi
+          fi
+
+          echo "=== Applying SELinux labels on added components ==="
+          for name in \
+            ExtShared LiveWallpapersPicker ContactsPicker WallpaperBackup \
+            Provision ThemePicker ModuleMetadata DeskClock ExactCalculator \
+            LatinIME webview Jelly Contacts ; do
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              rel="${d#$WORK_ROOT/work/vanilla_}"
+              part="${rel%%_raw/*}"
+              rest="${rel#${part}_raw/}"
+              label_dir "$WORK_ROOT/work/gapps_${part}_raw/$rest"
+            done < <(find_component vanilla "$name" dir || true)
+          done
+
+          for name in \
+            android.software.live_wallpaper.xml com.android.provision.xml \
+            com.android.contacts.xml libjni_latinime.so \
+            preinstalled-packages-org.lineageos.jelly.xml \
+            initial-package-stopped-states-org.lineageos.jelly.xml \
+            com.android.extservices.apex ; do
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              rel="${f#$WORK_ROOT/work/vanilla_}"
+              part="${rel%%_raw/*}"
+              rest="${rel#${part}_raw/}"
+              label_file "$WORK_ROOT/work/gapps_${part}_raw/$rest"
+            done < <(find_component vanilla "$name" file || true)
+          done
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            rel="${f#$WORK_ROOT/work/vanilla_}"
+            part="${rel%%_raw/*}"
+            rest="${rel#${part}_raw/}"
+            label_file "$WORK_ROOT/work/gapps_${part}_raw/$rest"
+          done < <(find_component_glob vanilla 'LatinIME__*_auto_generated_rro_product.apk' || true)
+
+          echo "=== AOSP components added ==="
+
+      # ------------------------------------------------------------------
+      # Detect UUID/format/EROFS params
+      # ------------------------------------------------------------------
+      - name: Detect original UUIDs and filesystem format
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          for part in $PARTITIONS; do
+            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ] && [ -f "$img" ]; then
+              if dump.erofs -s "$img" >/dev/null 2>&1; then
+                UUID=$(dump.erofs -s "$img" 2>/dev/null | grep -oP 'UUID:\s*\K[0-9a-f-]+' | head -1 || true)
+                echo "$UUID" > "${part}_uuid.txt"; echo "erofs" > "${part}_format.txt"
+                echo "${part}: EROFS, UUID=${UUID:-unknown}"
+              elif blkid -o value -s UUID "$img" >/dev/null 2>&1; then
+                UUID=$(blkid -o value -s UUID "$img" 2>/dev/null || true)
+                echo "$UUID" > "${part}_uuid.txt"; echo "ext4" > "${part}_format.txt"
+                echo "${part}: ext4, UUID=${UUID:-unknown}"
+              else
+                echo "" > "${part}_uuid.txt"; echo "erofs" > "${part}_format.txt"
+                echo "${part}: unknown"
+              fi
+            else
+              echo "" > "${part}_uuid.txt"; echo "erofs" > "${part}_format.txt"
+              echo "WARNING: GApps ${part}.img not found"
+            fi
+          done
+
+      - name: Detect EROFS parameters
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          detect_erofs_params() {
+            local img="$1" opts="" ftype=$(file -b "$img" 2>/dev/null) comp=""
+            echo "$ftype" | grep -qi LZ4     && comp=lz4
+            echo "$ftype" | grep -qi LZMA    && comp=lzma
+            echo "$ftype" | grep -qi DEFLATE && comp=deflate
+            echo "$ftype" | grep -qi ZSTD    && comp=zstd
+            local dump=""; command -v dump.erofs >/dev/null && dump=$(dump.erofs -s "$img" 2>/dev/null || true)
+            local blocksize=4096 pcluster=65536 comp_level="" extra=""
+            if [ -n "$dump" ]; then
+              local blk_log2=$(echo "$dump" | grep -oP 'blkszbits[^\d]*\K\d+' | head -1)
+              [ -n "$blk_log2" ] && blocksize=$((1 << blk_log2))
+              local pc=$(echo "$dump" | grep -oP 'pclusterblks[^\d]*\K\d+' | head -1)
+              [ -n "$pc" ] && pcluster=$((pc * blocksize))
+              local lvl=$(echo "$dump" | grep -oP 'compress[._ ]?level[^\d]*\K\d+' | head -1)
+              [ -n "$lvl" ] && comp_level=",level=$lvl"
+              echo "$dump" | grep -qi FRAGMENTS    && extra="$extra -Efragments"
+              echo "$dump" | grep -qi DEDUPE       && extra="$extra -Ededupe"
+              echo "$dump" | grep -qi ZERO_PADDING && extra="$extra -E0padding"
+            fi
+            [ -z "$comp" ] && comp=lz4hc
+            opts="-z$comp$comp_level -b$blocksize"
+            [ "$pcluster" != "4096" ] && opts="$opts -C$pcluster"
+            opts="$opts $extra"
+            echo "$opts" | xargs
+          }
+          for part in $PARTITIONS; do
+            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ]; then
+              opts=$(detect_erofs_params "$img")
+              echo "EROFS params for ${part}: $opts"
+              echo "$opts" > "${part}_erofs_params.txt"
+            else
+              echo "-zlz4hc -b4096 -C65536" > "${part}_erofs_params.txt"
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # Rebuild images preserving format and UUID
+      # ------------------------------------------------------------------
+      - name: Rebuild images preserving format and UUID
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          build_erofs() {
+            local raw="$1" out="$2" uuid="$3" pf="$4"
+            local opts=$(cat "$pf" 2>/dev/null || echo "-zlz4hc -b4096 -C65536")
+            echo "  EROFS params: $opts"
+            if [ -n "$uuid" ]; then mkfs.erofs $opts -U "$uuid" "$out" "$raw"; else mkfs.erofs $opts "$out" "$raw"; fi
+          }
+          build_ext4() {
+            local raw="$1" out="$2" uuid="$3" orig="$4"
+            local size=$(du -sb "$raw" | awk '{print $1}')
+            size=$((size + size / 10 + 16*1024*1024))
+            truncate -s "$size" "$out"
+            if [ -n "$uuid" ]; then mkfs.ext4 -F -U "$uuid" -d "$raw" "$out"; else mkfs.ext4 -F -d "$raw" "$out"; fi
+            if [ -f "$orig" ] && file -b "$orig" | grep -qi "Android sparse"; then
+              img2simg "$out" "${out}.sparse" && mv "${out}.sparse" "$out"
+            fi
+          }
+          for part in $PARTITIONS; do
+            raw="gapps_${part}_raw"
+            [ -d "$raw" ] || { echo "WARNING: $raw not found, skipping $part"; continue; }
+            fmt=$(cat "${part}_format.txt" 2>/dev/null || echo erofs)
+            uuid=$(cat "${part}_uuid.txt" 2>/dev/null || echo "")
+            orig=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            echo "=== Building ${part} (format=$fmt, uuid=$uuid) ==="
+            if [ "$fmt" = "ext4" ]; then
+              build_ext4 "$raw" "${part}.img" "$uuid" "$orig"
+            else
+              build_erofs "$raw" "${part}.img" "$uuid" "${part}_erofs_params.txt"
+            fi
+            file "${part}.img"
+            ls -lh "${part}.img"
+          done
+
+      # ------------------------------------------------------------------
+      # Validation — every vanilla component must be present in gapps
+      # ------------------------------------------------------------------
+      - name: VALIDATE that Vanilla components are present in rebuilt trees
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/work"
+          source ./helpers.sh
+          FAIL=0
+
+          for name in \
+            ExtShared LiveWallpapersPicker ContactsPicker WallpaperBackup \
+            Provision ThemePicker ModuleMetadata DeskClock ExactCalculator \
+            LatinIME webview Jelly Contacts ; do
+            while IFS= read -r v; do
+              [ -z "$v" ] && continue
+              rel="${v#$WORK_ROOT/work/vanilla_}"
+              part="${rel%%_raw/*}"
+              rest="${rel#${part}_raw/}"
+              g="$WORK_ROOT/work/gapps_${part}_raw/$rest"
+              if [ ! -e "$g" ] && [ ! -L "$g" ]; then
+                echo "MISSING: $name -> $g"; FAIL=1
+              fi
+            done < <(find_component vanilla "$name" dir || true)
+          done
+
+          for name in \
+            android.software.live_wallpaper.xml com.android.provision.xml \
+            com.android.contacts.xml libjni_latinime.so \
+            preinstalled-packages-org.lineageos.jelly.xml \
+            initial-package-stopped-states-org.lineageos.jelly.xml ; do
+            while IFS= read -r v; do
+              [ -z "$v" ] && continue
+              rel="${v#$WORK_ROOT/work/vanilla_}"
+              part="${rel%%_raw/*}"
+              rest="${rel#${part}_raw/}"
+              g="$WORK_ROOT/work/gapps_${part}_raw/$rest"
+              if [ -L "$v" ]; then
+                [ "$(readlink "$v")" = "$(readlink "$g" 2>/dev/null)" ] || { echo "LINK MISMATCH: $g"; FAIL=1; }
+              else
+                cmp -s "$v" "$g" || { echo "CONTENT MISMATCH: $g"; FAIL=1; }
+              fi
+            done < <(find_component vanilla "$name" file || true)
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "FATAL: validation failed"; exit 1
+          fi
+          echo "Validation OK"
+
+      # ------------------------------------------------------------------
+      # Sizes, ZIP, release
+      # ------------------------------------------------------------------
+      - name: Log sizes before/after
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          echo "=== Source sizes ===" | tee sizes_before.txt
+          for part in $PARTITIONS; do
+            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            [ -n "$img" ] && printf '%-11s %12s bytes  %s\n' "$part" "$(stat -c %s "$img")" "$img" | tee -a sizes_before.txt
+          done
+          echo "" | tee -a sizes_before.txt
+          echo "=== Rebuilt sizes ===" | tee sizes_after.txt
+          for part in $PARTITIONS; do
+            [ -f "${part}.img" ] && printf '%-11s %12s bytes  fmt=%s  uuid=%s\n' \
+              "$part" "$(stat -c %s "${part}.img")" \
+              "$(cat ${part}_format.txt 2>/dev/null || echo '?')" \
+              "$(cat ${part}_uuid.txt 2>/dev/null || echo '-')" | tee -a sizes_after.txt
+          done
+
+      - name: Create recovery flashable ZIP
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          rm -rf zip; mkdir -p zip/META-INF/com/google/android
+          cp system.img system_ext.img product.img zip/
+          cat > zip/META-INF/com/google/android/update-binary <<'EOF'
+          #!/sbin/sh
+          OUTFD=$2
+          ui_print() { echo "ui_print $1" >&$OUTFD; echo "ui_print" >&$OUTFD; }
+          flash_image() {
+            local img="$1" part="$2"
+            [ -f "$img" ] || { ui_print "WARN: $img missing"; return; }
+            ui_print "Flashing $part"
+            dd if="$img" of="/dev/block/by-name/$part" bs=1M 2>/dev/null || \
+              dd if="$img" of="/dev/block/bootdevice/by-name/$part" bs=1M 2>/dev/null || \
+              ui_print "ERROR: $part"
+          }
+          ui_print "=== Convert GApps to Vanilla ==="
+          flash_image "system.img" "system"
+          flash_image "system_ext.img" "system_ext"
+          flash_image "product.img" "product"
+          ui_print "=== Done ==="
+          EOF
+          chmod +x zip/META-INF/com/google/android/update-binary
+          cat > zip/META-INF/com/google/android/updater-script <<'EOF'
+          package_extract_file("system.img", "/tmp/system.img");
+          package_extract_file("system_ext.img", "/tmp/system_ext.img");
+          package_extract_file("product.img", "/tmp/product.img");
+          run_program("/sbin/sh", "/tmp/update-binary", "3", "1", "/tmp/updater-script");
+          EOF
+          cd zip && zip -r -9 ../convert-to-vanilla.zip . -x "*.git*" && cd ..
+          ls -lh convert-to-vanilla.zip
+          Z=$(stat -c %s convert-to-vanilla.zip)
+          if [ "$Z" -ge 2147483648 ]; then
+            echo "Splitting (>2GiB)"
+            rm -f convert-to-vanilla-split.*
+            mv convert-to-vanilla.zip convert-to-vanilla-oversized.zip
+            zip -r -9 -s 1900m convert-to-vanilla-split.zip zip -x "*.git*" >/dev/null
+            rm -f convert-to-vanilla-oversized.zip
+            ls -lh convert-to-vanilla-split.*
+          fi
+
+      - name: Determine release tag
+        id: release_tag
+        run: |
+          if [ "${{ github.event.inputs.release_tag }}" = "auto" ]; then
+            TAG="vanilla-$(date +%Y%m%d-%H%M)"
+          else
+            TAG="${{ github.event.inputs.release_tag }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Release tag: $TAG"
+
+      - name: Compute release display name from URLs
+        id: release_name
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.gapps_url }}"
+          NAME=""
+          CD=$(curl -sIL --max-time 20 "$URL" 2>/dev/null | tr -d '\r' | grep -i '^content-disposition:' | tail -1 || true)
+          if [ -n "$CD" ]; then
+            NAME=$(echo "$CD" | grep -oP "filename\*?=(?:UTF-8'')?\"?\\K[^\";]+" | head -1 || true)
+            NAME=$(python3 -c "import urllib.parse,sys;print(urllib.parse.unquote(sys.argv[1]))" "$NAME" 2>/dev/null || echo "$NAME")
+          fi
+          if [ -z "$NAME" ] || [ "$NAME" = "download" ]; then
+            BASE="${URL%%\?*}"; BASE="${BASE%%#*}"; NAME="${BASE##*/}"
+          fi
+          NAME="${NAME%.zip}"; NAME="${NAME%.img}"; NAME="${NAME%.xz}"
+          [ -z "$NAME" ] || [ "$NAME" = "download" ] && NAME="vanilla-conversion"
+          echo "release_name=$NAME" >> $GITHUB_OUTPUT
+          echo "Release name: $NAME"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: "${{ steps.release_name.outputs.release_name }}"
+          body: |
+            ## GApps to Vanilla (hardcoded strict, all partitions)
+
+            **GApps source:** ${{ github.event.inputs.gapps_url }}
+            **Vanilla source:** ${{ github.event.inputs.vanilla_url }}
+
+            **Artifacts:**
+            - `system.img`
+            - `system_ext.img`
+            - `product.img`
+            - `convert-to-vanilla.zip` (recovery flashable)
+
+            **Approach:** strict hardcoded removal of GApps (Velvet, Phonesky, GmsCore, SetupWizard, WebViewGoogle, LatinIMEGoogle, Chrome, talkback, GoogleTTS, TrichromeLibrary, etc.) and strict hardcoded addition of AOSP components from Vanilla (ExtShared, LiveWallpapersPicker, ContactsPicker, WallpaperBackup, Provision, ThemePicker, ModuleMetadata, DeskClock, ExactCalculator, LatinIME, WebView, Contacts, Jelly).
+
+            **Search scope:** every component is searched across all partitions (system, system_ext, product) and all component dirs (priv-app, app, overlay, lib, lib64, etc/permissions, etc/sysconfig, apex). A component found in vanilla's `system_ext/app/ContactsPicker` is copied to gapps's `system_ext/app/ContactsPicker`, and one found in `product/priv-app/Contacts` goes to `product/priv-app/Contacts`. If gapps already has the component in a different partition, that path is also removed (via `remove_component`).
+
+            **Preserved:** ext4/EROFS format, UUIDs, SELinux contexts (set on all added files). `build.prop` and `framework-res.apk` are not replaced.
+          files: |
+            /mnt/work/work/system.img
+            /mnt/work/work/system_ext.img
+            /mnt/work/work/product.img
+            /mnt/work/work/convert-to-vanilla.zip
+            /mnt/work/work/convert-to-vanilla-split.z*
+            /mnt/work/work/convert-to-vanilla-split.zip
+          fail_on_unmatched_files: false
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanilla-images
+          path: |
+            /mnt/work/work/system.img
+            /mnt/work/work/system_ext.img
+            /mnt/work/work/product.img
+            /mnt/work/work/convert-to-vanilla.zip
+            /mnt/work/work/convert-to-vanilla-split.z*
+            /mnt/work/work/convert-to-vanilla-split.zip
+            /mnt/work/work/*_format.txt
+            /mnt/work/work/*_uuid.txt
+            /mnt/work/work/*_erofs_params.txt
+            /mnt/work/work/sizes_before.txt
+            /mnt/work/work/sizes_after.txt
+          retention-days: 7
